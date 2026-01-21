@@ -67,6 +67,12 @@ impl std::str::FromStr for PairingCode {
     }
 }
 
+impl std::fmt::Display for PairingCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.code)
+    }
+}
+
 /// Session key derived from pairing
 #[derive(Debug)]
 pub struct SessionKey {
