@@ -69,10 +69,10 @@ Copyright © 2024 XenithCode.
 ```mermaid
 graph TD
     A["UI Layer (WPF/Compose/SwiftUI)"] <-->|FFI / JNI| B["VoidWarp Core (Rust)"]
-    B --> C[Discovery (mDNS)]
-    B --> D[Transport (UDP/VWTP)]
-    B --> E[Security (Ring/AES)]
-    B --> F[File I/O]
+    B --> C["Discovery (mDNS)"]
+    B --> D["Transport (UDP/VWTP)"]
+    B --> E["Security (Ring/AES)"]
+    B --> F["File I/O"]
 ```
 
 详细协议文档请参阅 [docs/protocol/PROTOCOL_SPEC.md](docs/protocol/PROTOCOL_SPEC.md)。
