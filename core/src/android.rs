@@ -3,7 +3,7 @@
 
 use crate::ffi;
 use jni::objects::{JClass, JObject, JString, JValue};
-use jni::sys::{jboolean, jint, jlong, jobjectArray, jstring};
+use jni::sys::{jint, jlong, jobject, jobjectArray, jstring};
 use jni::JNIEnv;
 use std::ffi::{CStr, CString};
 
@@ -187,7 +187,7 @@ pub unsafe extern "C" fn Java_com_voidwarp_android_native_NativeLib_voidwarpSend
     mut env: JNIEnv,
     _class: JClass,
     sender: jlong,
-) -> JObject<'static> {
+) -> jobject {
     let progress = ffi::voidwarp_sender_get_progress(sender as *const ffi::FfiFileSender);
 
     let progress_class = env
@@ -209,7 +209,7 @@ pub unsafe extern "C" fn Java_com_voidwarp_android_native_NativeLib_voidwarpSend
         )
         .expect("Failed to create TransferProgress object");
 
-    obj
+    obj.into_raw()
 }
 
 #[no_mangle]
