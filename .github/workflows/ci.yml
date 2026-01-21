@@ -13,6 +13,9 @@ jobs:
   core-library:
     name: Core Library (Rust)
     runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: core
     
     steps:
     - uses: actions/checkout@v4
@@ -24,6 +27,8 @@ jobs:
         
     - name: Cache dependencies
       uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: core
       
     - name: Check Formatting
       run: cargo fmt -- --check
@@ -49,6 +54,7 @@ jobs:
       uses: dtolnay/rust-toolchain@stable
     
     - name: Build Core DLL
+      working-directory: core
       run: cargo build --release
       
     - name: Setup .NET
@@ -79,7 +85,8 @@ jobs:
       run: cargo install cargo-ndk
       
     - name: Build Rust Library for Android
-      run: cargo ndk -t arm64-v8a -o platforms/android/app/src/main/jniLibs build --release
+      working-directory: core
+      run: cargo ndk -t arm64-v8a -o ../platforms/android/app/src/main/jniLibs build --release
       
     - name: Setup Java
       uses: actions/setup-java@v4
@@ -89,4 +96,4 @@ jobs:
         
     - name: Build APK
       working-directory: platforms/android
-      run: ./gradlew assembleDebug
+      run: gradle assembleDebug
