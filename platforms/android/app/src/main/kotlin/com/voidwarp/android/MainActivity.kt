@@ -11,6 +11,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -309,6 +310,31 @@ fun MainScreen(
                 Spacer(modifier = Modifier.height(8.dp))
             }
             
+            // File Selection Button (when no file selected)
+            if (selectedFileName == null) {
+                OutlinedButton(
+                    onClick = { filePickerLauncher.launch(arrayOf("*/*")) },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(50.dp),
+                    shape = RoundedCornerShape(8.dp),
+                    border = BorderStroke(1.dp, Color(0xFF4A4E69)),
+                    colors = ButtonDefaults.outlinedButtonColors(
+                        containerColor = Color(0xFF16213E),
+                        contentColor = Color.LightGray
+                    )
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Add,
+                        contentDescription = "选择文件",
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("点击选择文件", fontSize = 14.sp)
+                }
+                Spacer(modifier = Modifier.height(12.dp))
+            }
+
             // Transfer Progress
             if (transferProgress > 0) {
                 LinearProgressIndicator(
@@ -424,22 +450,7 @@ fun MainScreen(
             }
         }
         
-        // FAB for file picker
-        FloatingActionButton(
-            onClick = {
-                filePickerLauncher.launch(arrayOf("*/*"))
-            },
-            modifier = Modifier
-                .align(Alignment.BottomEnd)
-                .padding(end = 16.dp, bottom = 80.dp),
-            containerColor = Color(0xFF6C63FF)
-        ) {
-            Icon(
-                imageVector = Icons.Default.Add,
-                contentDescription = "选择文件",
-                tint = Color.White
-            )
-        }
+        // FAB removed to avoid blocking content
     }
     
     // Manual Peer Addition Dialog

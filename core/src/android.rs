@@ -140,63 +140,63 @@ pub unsafe extern "C" fn Java_com_voidwarp_android_native_NativeLib_voidwarpGetP
     _class: JClass,
     handle: jlong,
 ) -> jobjectArray {
-    let handle_ptr = handle as *const ffi::VoidWarpHandle;
-    
+    let list = ffi::voidwarp_get_peers(handle as *const ffi::VoidWarpHandle);
+
     // Create PeerInfo array
     let peer_class = env
         .find_class("com/voidwarp/android/native/NativeLib$PeerInfo")
         .expect("Could not find PeerInfo class");
+
     let initial_element = JObject::null();
-    
-    if handle_ptr.is_null() {
-         return env.new_object_array(0, &peer_class, &initial_element).expect("Could not create array").into_raw();
-    }
-
-    let handle = &*handle_ptr;
-    let peers = if let Some(discovery) = &handle.discovery {
-        discovery.get_peers()
-    } else {
-        Vec::new()
-    };
-
     let output_array = env
-        .new_object_array(peers.len() as i32, &peer_class, &initial_element)
+        .new_object_array(list.count as i32, &peer_class, &initial_element)
         .expect("Could not create array");
 
-    for (i, peer) in peers.iter().enumerate() {
-        let j_id = env.new_string(&peer.device_id).unwrap_or_else(|_| env.new_string("").unwrap());
-        let j_name = env.new_string(&peer.device_name).unwrap_or_else(|_| env.new_string("Unknown").unwrap());
-        
-        // Prioritize IPv4 and avoid link-local/loopback
-        let best_ip = peer.addresses.iter()
-            .find(|ip| {
-                match ip {
-                    std::net::IpAddr::V4(ipv4) => !ipv4.is_loopback() && !ipv4.is_link_local(),
-                    _ => false,
-                }
-            })
-            .or_else(|| peer.addresses.first());
-            
-        let ip_str = best_ip.map(|a| a.to_string()).unwrap_or_default();
-        let j_ip = env.new_string(&ip_str).unwrap();
+    if list.count > 0 && !list.peers.is_null() {
+        let peers_slice = std::slice::from_raw_parts(list.peers, list.count);
+        for (i, peer) in peers_slice.iter().enumerate() {
+            let id = if peer.device_id.is_null() {
+                std::borrow::Cow::from("")
+            } else {
+                CStr::from_ptr(peer.device_id).to_string_lossy()
+            };
 
-        let obj = env
-            .new_object(
-                &peer_class,
-                "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;I)V",
-                &[
-                    JValue::Object(&j_id),
-                    JValue::Object(&j_name),
-                    JValue::Object(&j_ip),
-                    JValue::Int(peer.port as i32),
-                ],
-            )
-            .expect("Failed to create PeerInfo object");
+            let name = if peer.device_name.is_null() {
+                std::borrow::Cow::from("Unknown")
+            } else {
+                CStr::from_ptr(peer.device_name).to_string_lossy()
+            };
 
-        env.set_object_array_element(&output_array, i as i32, &obj)
-            .expect("Failed to set array element");
+            let ip = if peer.ip_address.is_null() {
+                std::borrow::Cow::from("")
+            } else {
+                CStr::from_ptr(peer.ip_address).to_string_lossy()
+            };
+
+            let j_id = env.new_string(&*id).unwrap();
+            let j_name = env.new_string(&*name).unwrap();
+            let j_ip = env.new_string(&*ip).unwrap();
+
+            // Constructor: (String, String, String, Int)
+            let obj = env
+                .new_object(
+                    &peer_class,
+                    "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;I)V",
+                    &[
+                        JValue::Object(&j_id),
+                        JValue::Object(&j_name),
+                        JValue::Object(&j_ip),
+                        JValue::Int(peer.port as i32),
+                    ],
+                )
+                .expect("Failed to create PeerInfo object");
+
+            env.set_object_array_element(&output_array, i as i32, &obj)
+                .expect("Failed to set array element");
+        }
     }
 
+    ffi::voidwarp_free_peer_list(list);
     output_array.into_raw()
 }
 

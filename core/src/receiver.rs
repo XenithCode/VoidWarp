@@ -238,18 +238,7 @@ impl FileReceiverServer {
                 // Receive the file in chunks
                 let mut received: u64 = 0;
                 
-                // If resuming, we would send the resume chunk index here.
-                // For now, we always start from 0.
-                // Protocol requires sending 8 bytes of resume index if we want to support it?
-                // sender.rs L178: reads 8 bytes IF not resuming from its side?
-                // Actually sender logic:
-                // let start_chunk = if self.resume_from_chunk > 0 { ... } else { check_receiver_resume(...) }
-                // Receiver isn't currently designed to request resume, so we should send 0 or nothing?
-                // Wait, sender protocol says:
-                // "If resuming... else { let mut resume_buf = [0u8; 8]; if stream.read_exact... }"
-                // Sender tries to read 8 bytes. If we don't send anything, sender might timeout or continue with 0 if read fails?
-                // "if stream.read_exact(&mut resume_buf).is_ok()"
-                // Best to send 0u64 explicitly to indicate start from beginning.
+                // Send resume index (0)
                 let _ = conn.write_all(&0u64.to_be_bytes());
                 
                 loop {
@@ -278,7 +267,6 @@ impl FileReceiverServer {
                      conn.read_exact(&mut chunk_checksum_buf)?;
                      
                      // Verify checksum
-                     // sender sends first 8 bytes of hex string
                      let calculated_hex = calculate_chunk_checksum(&data);
                      let calculated_bytes: Vec<u8> = (0..std::cmp::min(16, calculated_hex.len()))
                         .step_by(2)
@@ -288,31 +276,12 @@ impl FileReceiverServer {
                      if calculated_bytes != chunk_checksum_buf {
                          tracing::warn!("Checksum mismatch for chunk {}", chunk_index);
                          // Send ACK with error (1)
-                         // [index: 8 bytes][status: 1 byte]
                          conn.write_all(&chunk_index.to_be_bytes())?;
                          conn.write_all(&[1u8])?;
-                         // In a real implementation we might want to continue loop to let sender retry?
-                         // Sender will retry on its own, but we just consumed the data.
-                         // We should NOT write to file.
                          continue;
                      }
                      
                      // Write to file
-                     // Seek to correct position (supports out of order or resume)
-                     // Using chunk_index * default_chunk_size might be risky if chunk size variable?
-                     // sender.rs uses fixed chunk size usually.
-                     // But we have `received` counter.
-                     // Let's assume sequential for now OR we blindly append?
-                     // Sender sends [index], so we should use it.
-                     // But we don't know sender's chunk size here (it's not in handshake packets, only implicitly).
-                     // However, we can just append if we assume ordered delivery (TCP).
-                     // But we should use seek for correctness if we ever support resume.
-                     // Since we don't know the chunk size sender is using (it's configured on sender),
-                     // we can't easily seek without tracking position.
-                     // But wait, `data` has length. 
-                     // Ideally we just write `data` to the file.
-                     // If we want resume, we need to know offsets.
-                     // For now, let's just write_all. TCP ensures order.
                      file.write_all(&data)?;
                      received += data.len() as u64; // Use actual data len
                      self.bytes_received.store(received, Ordering::SeqCst);
@@ -325,7 +294,6 @@ impl FileReceiverServer {
                 // Final verification
                 file.flush()?;
                 
-                // Compare full file checksum
                 let final_checksum = calculate_file_checksum(&save_path)?;
                 let success = final_checksum == info.file_checksum;
                 
@@ -336,8 +304,15 @@ impl FileReceiverServer {
                 } else {
                      tracing::error!("Final checksum verification failed");
                      conn.write_all(&[0u8])?; // Final failure
-                     // Maybe delete file?
                 }
+
+                // Important: Reset running flag so we can restart the listener loop
+                // The previous listener thread exited when it accepted this connection.
+                self.running.store(false, Ordering::SeqCst);
+                
+                // Note: We don't auto-restart here because the user might want to see the "Completed" state.
+                // The UI should provide a way to "Reset" or "Listen Again".
+                // But for "reject", we definitely want to auto-restart.
                 
                 Ok(())
             }
@@ -359,6 +334,9 @@ impl FileReceiverServer {
         }
         
         *self.state.lock().unwrap() = ReceiverState::Listening;
+        
+        // Reset running flag so start() will actually spawn a new thread
+        self.running.store(false, Ordering::SeqCst);
         
         // Restart listening
         self.start();
