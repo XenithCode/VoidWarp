@@ -1,75 +1,150 @@
 <Window x:Class="VoidWarp.Windows.ManualPeerDialog"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="手动添加设备"
-        Height="240"
-        Width="360"
+        Title="Add Manual Device"
+        Height="280"
+        Width="400"
         WindowStartupLocation="CenterOwner"
         ResizeMode="NoResize"
-        Background="#1a1a2e">
-    <Grid Margin="20">
-        <Grid.RowDefinitions>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="*"/>
-            <RowDefinition Height="Auto"/>
-        </Grid.RowDefinitions>
+        Background="#121212">
+    
+    <Window.Resources>
+        <SolidColorBrush x:Key="PrimaryBrush" Color="#BB86FC"/>
+        <SolidColorBrush x:Key="SurfaceBrush" Color="#1E1E1E"/>
+        <SolidColorBrush x:Key="SurfaceLightBrush" Color="#2D2D2D"/>
+        <SolidColorBrush x:Key="TextPrimaryBrush" Color="#FFFFFF"/>
+        <SolidColorBrush x:Key="TextSecondaryBrush" Color="#B0B0B0"/>
+        <SolidColorBrush x:Key="TextTertiaryBrush" Color="#666666"/>
+        
+        <Style x:Key="InputStyle" TargetType="TextBox">
+            <Setter Property="Height" Value="40"/>
+            <Setter Property="Padding" Value="12,8"/>
+            <Setter Property="Background" Value="{StaticResource SurfaceLightBrush}"/>
+            <Setter Property="Foreground" Value="{StaticResource TextPrimaryBrush}"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="BorderBrush" Value="#333"/>
+            <Setter Property="FontSize" Value="14"/>
+            <Setter Property="VerticalContentAlignment" Value="Center"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="TextBox">
+                        <Border Background="{TemplateBinding Background}"
+                                BorderBrush="{TemplateBinding BorderBrush}"
+                                BorderThickness="{TemplateBinding BorderThickness}"
+                                CornerRadius="6">
+                            <ScrollViewer x:Name="PART_ContentHost" 
+                                          Margin="{TemplateBinding Padding}"
+                                          VerticalAlignment="Center"/>
+                        </Border>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+        
+        <Style x:Key="ModernButton" TargetType="Button">
+            <Setter Property="Height" Value="36"/>
+            <Setter Property="Padding" Value="20,8"/>
+            <Setter Property="FontSize" Value="14"/>
+            <Setter Property="FontWeight" Value="Medium"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="BorderThickness" Value="0"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="border" 
+                                Background="{TemplateBinding Background}" 
+                                CornerRadius="6" 
+                                Padding="{TemplateBinding Padding}">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="border" Property="Opacity" Value="0.85"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+    </Window.Resources>
+    
+    <Border Background="{StaticResource SurfaceBrush}" 
+            CornerRadius="12" 
+            Margin="16"
+            Padding="20">
+        <Grid>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="*"/>
+                <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
 
-        <TextBlock Text="手动添加设备"
-                   FontSize="16"
-                   FontWeight="Bold"
-                   Foreground="#6c63ff"
-                   Margin="0,0,0,12"/>
+            <!-- Header -->
+            <TextBlock Grid.Row="0"
+                       Text="Add Manual Device"
+                       FontSize="18"
+                       FontWeight="SemiBold"
+                       Foreground="{StaticResource PrimaryBrush}"
+                       Margin="0,0,0,16"/>
 
-        <TextBlock Grid.Row="1"
-                   Text="IP 地址"
-                   Foreground="#aaa"
-                   FontSize="12"
-                   Margin="0,0,0,4"/>
-        <TextBox x:Name="IpBox"
-                 Grid.Row="2"
-                 Height="30"
-                 VerticalContentAlignment="Center"
-                 Padding="6,0"
-                 Background="#2a2a4a"
-                 Foreground="White"
-                 BorderThickness="0"
-                 Text="192.168."/>
-
-        <StackPanel Grid.Row="3" Margin="0,12,0,0">
-            <TextBlock Text="端口"
-                       Foreground="#aaa"
+            <!-- IP Address -->
+            <TextBlock Grid.Row="1"
+                       Text="IP Address"
+                       Foreground="{StaticResource TextSecondaryBrush}"
                        FontSize="12"
-                       Margin="0,0,0,4"/>
-            <TextBox x:Name="PortBox"
-                     Height="30"
-                     VerticalContentAlignment="Center"
-                     Padding="6,0"
-                     Background="#2a2a4a"
-                     Foreground="White"
-                     BorderThickness="0"
-                     Text="42424"/>
-            <TextBlock Text="提示: USB 连接可使用 127.0.0.1:42424"
-                       Foreground="#666"
-                       FontSize="10"
-                       Margin="0,6,0,0"/>
-        </StackPanel>
+                       FontWeight="Medium"
+                       Margin="0,0,0,6"/>
+            <TextBox x:Name="IpBox"
+                     Grid.Row="2"
+                     Style="{StaticResource InputStyle}"
+                     Text="192.168."
+                     Margin="0,0,0,16"/>
 
-        <StackPanel Grid.Row="4" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,16,0,0">
-            <Button Content="取消"
-                    Width="70"
-                    Margin="0,0,8,0"
-                    Click="Cancel_Click"
-                    Background="#333"
-                    Foreground="White"
-                    BorderThickness="0"/>
-            <Button Content="添加"
-                    Width="70"
-                    Click="Ok_Click"
-                    Background="#6c63ff"
-                    Foreground="White"
-                    BorderThickness="0"/>
-        </StackPanel>
-    </Grid>
+            <!-- Port -->
+            <StackPanel Grid.Row="3">
+                <TextBlock Text="Port"
+                           Foreground="{StaticResource TextSecondaryBrush}"
+                           FontSize="12"
+                           FontWeight="Medium"
+                           Margin="0,0,0,6"/>
+                <TextBox x:Name="PortBox"
+                         Style="{StaticResource InputStyle}"
+                         Text="42424"/>
+            </StackPanel>
+
+            <!-- Hint -->
+            <TextBlock Grid.Row="4" 
+                       Foreground="{StaticResource TextTertiaryBrush}"
+                       FontSize="11"
+                       Margin="0,12,0,0"
+                       TextWrapping="Wrap">
+                <Run Text="💡 Tip: For USB connection, use 127.0.0.1:42424"/>
+                <LineBreak/>
+                <Run Text="(Run 'adb reverse tcp:42424 tcp:42424' on PC first)"/>
+            </TextBlock>
+
+            <!-- Buttons -->
+            <StackPanel Grid.Row="5" 
+                        Orientation="Horizontal" 
+                        HorizontalAlignment="Right" 
+                        Margin="0,20,0,0">
+                <Button Content="Cancel"
+                        Style="{StaticResource ModernButton}"
+                        Width="90"
+                        Margin="0,0,10,0"
+                        Click="Cancel_Click"
+                        Background="{StaticResource SurfaceLightBrush}"
+                        Foreground="{StaticResource TextPrimaryBrush}"/>
+                <Button Content="Add"
+                        Style="{StaticResource ModernButton}"
+                        Width="90"
+                        Click="Ok_Click"
+                        Background="{StaticResource PrimaryBrush}"
+                        Foreground="#000000"/>
+            </StackPanel>
+        </Grid>
+    </Border>
 </Window>

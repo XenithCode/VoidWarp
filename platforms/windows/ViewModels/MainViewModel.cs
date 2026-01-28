@@ -1,607 +1,792 @@
+using System;
 using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.Diagnostics;
+using System.IO;
 using System.Runtime.CompilerServices;
+using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Input;
-using System.Windows.Media;
 using Microsoft.Win32;
-using VoidWarp.Windows;
 using VoidWarp.Windows.Core;
 
 namespace VoidWarp.Windows.ViewModels
 {
+    /// <summary>
+    /// Main ViewModel for VoidWarp Windows client.
+    /// Manages application state with ObservableCollections and proper UI thread dispatching.
+    /// All UI updates are wrapped in Dispatcher.Invoke to avoid cross-thread exceptions.
+    /// </summary>
     public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
     {
+        #region Fields
+
         private readonly VoidWarpEngine _engine;
-        private readonly TransferManager _transferManager;
-        private readonly ReceiveManager _receiveManager;
-        private PendingTransferInfo? _pendingTransfer;
-        private bool _isReceiveModeEnabled;
-        private string _deviceIdText = "设备 ID: -";
-        private string _localNetworkText = "本机网络: -";
-        private string _discoveryStatusText = "未开始发现";
-        private string _discoveryDetailText = string.Empty;
-        private string _discoveryButtonText = "开始发现设备";
-        private Brush _discoveryStatusColor = new SolidColorBrush(Color.FromRgb(0x88, 0x88, 0x88));
-        private string _receiveStatusText = "等待接收文件...";
-        private string _receivePortText = "监听端口: -";
-        private bool _isIncomingTransferVisible;
-        private bool _isDropZoneVisible = true;
-        private string _transferStatusText = "等待传输...";
-        private double _transferProgress;
-        private DiscoveredPeer? _selectedPeer;
-        private string _incomingFileName = "文件: -";
-        private string _incomingFileSize = "大小: -";
-        private string _incomingSender = "来自: -";
+        private bool _isReceiving;
+        private bool _isDiscovering;
+        private bool _isSending;
+        private double _progressValue;
+        private string _statusMessage = "Ready";
+        private string _selectedFilePath = string.Empty;
+        private PeerItem? _selectedPeer;
+        private bool _disposed;
+        private bool _hasPendingTransfer;
+        private PendingTransferEventArgs? _pendingTransferInfo;
 
-        public ObservableCollection<DiscoveredPeer> Peers { get; } = [];
+        #endregion
 
-        public ICommand ToggleDiscoveryCommand { get; }
-        public ICommand ManualAddCommand { get; }
-        public ICommand OpenDownloadsCommand { get; }
+        #region Collections
+
+        /// <summary>
+        /// Discovered peers on the network.
+        /// Thread-safe: all updates go through Dispatcher.
+        /// </summary>
+        public ObservableCollection<PeerItem> Peers { get; } = new();
+
+        /// <summary>
+        /// Application log messages.
+        /// Thread-safe: all updates go through Dispatcher.
+        /// </summary>
+        public ObservableCollection<string> Logs { get; } = new();
+
+        #endregion
+
+        #region Properties
+
+        /// <summary>
+        /// Short device ID for display (first 8 characters, uppercase).
+        /// </summary>
+        public string DeviceId => _engine.ShortDeviceId;
+
+        /// <summary>
+        /// Machine name of this device.
+        /// </summary>
+        public string DeviceName => _engine.DeviceName;
+
+        /// <summary>
+        /// Port the receiver is listening on.
+        /// </summary>
+        public ushort ReceiverPort => _engine.ReceiverPort;
+
+        /// <summary>
+        /// True if the receiver is active.
+        /// </summary>
+        public bool IsReceiving
+        {
+            get => _isReceiving;
+            set
+            {
+                if (SetProperty(ref _isReceiving, value))
+                {
+                    OnPropertyChanged(nameof(ReceiverStatusText));
+                    OnPropertyChanged(nameof(ReceiverPort));
+                }
+            }
+        }
+
+        /// <summary>
+        /// Display text for receiver status.
+        /// </summary>
+        public string ReceiverStatusText => IsReceiving 
+            ? $"Listening on port {ReceiverPort}" 
+            : "Receiver disabled";
+
+        /// <summary>
+        /// True if discovery is running.
+        /// </summary>
+        public bool IsDiscovering
+        {
+            get => _isDiscovering;
+            set
+            {
+                if (SetProperty(ref _isDiscovering, value))
+                {
+                    OnPropertyChanged(nameof(ScanButtonText));
+                    OnPropertyChanged(nameof(DiscoveryStatusText));
+                }
+            }
+        }
+
+        /// <summary>
+        /// Text for the scan button.
+        /// </summary>
+        public string ScanButtonText => IsDiscovering ? "Stop" : "Scan";
+
+        /// <summary>
+        /// Discovery status text for display.
+        /// </summary>
+        public string DiscoveryStatusText => IsDiscovering ? "Scanning..." : "Idle";
+
+        /// <summary>
+        /// True if currently sending a file.
+        /// </summary>
+        public bool IsSending
+        {
+            get => _isSending;
+            set
+            {
+                if (SetProperty(ref _isSending, value))
+                {
+                    OnPropertyChanged(nameof(CanSend));
+                    OnPropertyChanged(nameof(IsTransferring));
+                }
+            }
+        }
+
+        /// <summary>
+        /// True if any transfer (send or receive) is in progress.
+        /// </summary>
+        public bool IsTransferring => IsSending || _hasPendingTransfer;
+
+        /// <summary>
+        /// Transfer progress (0-100).
+        /// </summary>
+        public double ProgressValue
+        {
+            get => _progressValue;
+            set => SetProperty(ref _progressValue, Math.Min(100, Math.Max(0, value)));
+        }
+
+        /// <summary>
+        /// Current status message for display.
+        /// </summary>
+        public string StatusMessage
+        {
+            get => _statusMessage;
+            set => SetProperty(ref _statusMessage, value ?? "");
+        }
+
+        /// <summary>
+        /// Path to the selected file for sending.
+        /// </summary>
+        public string SelectedFilePath
+        {
+            get => _selectedFilePath;
+            set
+            {
+                if (SetProperty(ref _selectedFilePath, value ?? ""))
+                {
+                    OnPropertyChanged(nameof(HasFileSelected));
+                    OnPropertyChanged(nameof(CanSend));
+                    OnPropertyChanged(nameof(SelectedFileName));
+                    OnPropertyChanged(nameof(SelectedFileInfo));
+                }
+            }
+        }
+
+        /// <summary>
+        /// Just the filename of the selected file.
+        /// </summary>
+        public string SelectedFileName => string.IsNullOrEmpty(SelectedFilePath)
+            ? "No file selected"
+            : Path.GetFileName(SelectedFilePath);
+
+        /// <summary>
+        /// File info with size for display.
+        /// </summary>
+        public string SelectedFileInfo
+        {
+            get
+            {
+                if (string.IsNullOrEmpty(SelectedFilePath) || !File.Exists(SelectedFilePath))
+                    return "No file selected";
+                
+                try
+                {
+                    var info = new FileInfo(SelectedFilePath);
+                    return $"{info.Name} ({FormatSize(info.Length)})";
+                }
+                catch
+                {
+                    return Path.GetFileName(SelectedFilePath);
+                }
+            }
+        }
+
+        /// <summary>
+        /// True if a valid file is selected.
+        /// </summary>
+        public bool HasFileSelected => !string.IsNullOrEmpty(SelectedFilePath) && File.Exists(SelectedFilePath);
+
+        /// <summary>
+        /// Currently selected peer for sending.
+        /// </summary>
+        public PeerItem? SelectedPeer
+        {
+            get => _selectedPeer;
+            set
+            {
+                if (SetProperty(ref _selectedPeer, value))
+                {
+                    OnPropertyChanged(nameof(CanSend));
+                    OnPropertyChanged(nameof(HasPeerSelected));
+                    
+                    if (value != null)
+                    {
+                        AddLog($"Selected: {value.DeviceName} ({value.DisplayName})");
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// True if a peer is selected.
+        /// </summary>
+        public bool HasPeerSelected => SelectedPeer != null;
+
+        /// <summary>
+        /// True if send operation can proceed.
+        /// </summary>
+        public bool CanSend => HasFileSelected && HasPeerSelected && !IsSending;
+
+        /// <summary>
+        /// Local IP addresses info for display.
+        /// </summary>
+        public string LocalIpInfo
+        {
+            get
+            {
+                var ips = VoidWarpEngine.GetAllLocalIpAddresses();
+                return ips.Count > 0 ? string.Join(" | ", ips) : "No network";
+            }
+        }
+
+        /// <summary>
+        /// True if native library loaded successfully.
+        /// </summary>
+        public bool IsNativeLoaded => _engine.NativeLoaded || _engine.IsInitialized;
+
+        /// <summary>
+        /// Warning message if native library failed to load.
+        /// </summary>
+        public string? NativeLoadWarning => !IsNativeLoaded ? _engine.NativeLoadError : null;
+
+        #endregion
+
+        #region Commands
+
+        public ICommand ScanCommand { get; }
+        public ICommand SendFileCommand { get; }
+        public ICommand ToggleReceiverCommand { get; }
+        public ICommand SelectFileCommand { get; }
+        public ICommand ClearLogsCommand { get; }
         public ICommand TestConnectionCommand { get; }
-        public ICommand AcceptTransferCommand { get; }
-        public ICommand RejectTransferCommand { get; }
-        public ICommand ShowNetworkDiagnosticsCommand { get; }
+        public ICommand OpenDownloadsCommand { get; }
+        public ICommand AddManualPeerCommand { get; }
+        public ICommand CancelTransferCommand { get; }
+
+        #endregion
+
+        #region Events
 
         public event PropertyChangedEventHandler? PropertyChanged;
 
+        #endregion
+
+        #region Constructor
+
         public MainViewModel()
         {
-            _engine = new VoidWarpEngine(Environment.MachineName);
-            _transferManager = new TransferManager();
-            _receiveManager = new ReceiveManager();
+            _engine = VoidWarpEngine.Instance;
 
-            _engine.PeersChanged += OnPeersChanged;
-            _engine.DiscoveryStateChanged += OnDiscoveryStateChanged;
-            _engine.DiscoveryDiagnosticsChanged += OnDiscoveryDiagnosticsChanged;
+            // Subscribe to engine events
+            _engine.OnLog += Engine_OnLog;
+            _engine.OnPeerDiscovered += Engine_OnPeerDiscovered;
+            _engine.OnProgress += Engine_OnProgress;
+            _engine.OnTransferComplete += Engine_OnTransferComplete;
+            _engine.OnPendingTransfer += Engine_OnPendingTransfer;
 
-            _transferManager.ProgressChanged += OnTransferProgressChanged;
-            _transferManager.TransferCompleted += OnTransferCompleted;
+            // Initialize commands
+            ScanCommand = new RelayCommand(_ => ToggleScan());
+            SendFileCommand = new RelayCommand(async _ => await SendFileAsync(), _ => CanSend);
+            ToggleReceiverCommand = new RelayCommand(_ => ToggleReceiver());
+            SelectFileCommand = new RelayCommand(_ => SelectFile());
+            ClearLogsCommand = new RelayCommand(_ => ClearLogs());
+            TestConnectionCommand = new RelayCommand(peer => TestConnection(peer as PeerItem));
+            OpenDownloadsCommand = new RelayCommand(_ => OpenDownloadsFolder());
+            AddManualPeerCommand = new RelayCommand(_ => ShowAddPeerDialog());
+            CancelTransferCommand = new RelayCommand(_ => CancelTransfer());
 
-            _receiveManager.TransferRequested += OnIncomingTransfer;
-            _receiveManager.ProgressChanged += OnReceiveProgressChanged;
-            _receiveManager.TransferCompleted += OnReceiveCompleted;
-            _receiveManager.StateChanged += OnReceiverStateChanged;
+            // Initial log
+            AddLog("VoidWarp Windows Client started");
+            AddLog($"Device: {DeviceName} | ID: {DeviceId}");
 
-            ToggleDiscoveryCommand = new RelayCommand(_ => ToggleDiscovery());
-            ManualAddCommand = new RelayCommand(_ => AddManualPeer());
-            OpenDownloadsCommand = new RelayCommand(_ => OpenDownloads());
-            TestConnectionCommand = new RelayCommand(param => TestConnection(param as DiscoveredPeer));
-            AcceptTransferCommand = new RelayCommand(_ => AcceptPendingTransferAsync());
-            RejectTransferCommand = new RelayCommand(_ => RejectPendingTransfer());
-            ShowNetworkDiagnosticsCommand = new RelayCommand(_ => FirewallHelper.ShowNetworkTroubleshootingDialog());
-
-            DeviceIdText = $"设备 ID: {_engine.DeviceId[..8]}...";
-            UpdateNetworkDiagnostics();
-
-            InitializeReceiving();
-            StartDiscovery(_receiveManager.Port);
-        }
-
-        public string DeviceIdText
-        {
-            get => _deviceIdText;
-            private set => SetProperty(ref _deviceIdText, value);
-        }
-
-        public string LocalNetworkText
-        {
-            get => _localNetworkText;
-            private set => SetProperty(ref _localNetworkText, value);
-        }
-
-        public string DiscoveryStatusText
-        {
-            get => _discoveryStatusText;
-            private set => SetProperty(ref _discoveryStatusText, value);
-        }
-
-        public string DiscoveryDetailText
-        {
-            get => _discoveryDetailText;
-            private set => SetProperty(ref _discoveryDetailText, value);
-        }
-
-        public string DiscoveryButtonText
-        {
-            get => _discoveryButtonText;
-            private set => SetProperty(ref _discoveryButtonText, value);
-        }
-
-        public Brush DiscoveryStatusColor
-        {
-            get => _discoveryStatusColor;
-            private set => SetProperty(ref _discoveryStatusColor, value);
-        }
-
-        public bool IsReceiveModeEnabled
-        {
-            get => _isReceiveModeEnabled;
-            set
+            // Check native library status
+            if (!_engine.IsInitialized)
             {
-                if (SetProperty(ref _isReceiveModeEnabled, value))
+                AddLog($"WARNING: Engine not initialized - {_engine.NativeLoadError ?? "unknown error"}");
+                StatusMessage = "DLL not loaded!";
+            }
+            else
+            {
+                AddLog("Native library loaded successfully");
+                // Auto-start receiver and discovery
+                _ = InitializeAsync();
+            }
+        }
+
+        #endregion
+
+        #region Initialization
+
+        private async Task InitializeAsync()
+        {
+            try
+            {
+                AddLog("Auto-starting receiver...");
+                
+                // Start receiver first to get the port
+                _engine.StartReceiver();
+                
+                // Wait for port assignment
+                await Task.Delay(500);
+                
+                InvokeOnUI(() =>
                 {
-                    if (value)
-                    {
-                        _ = _receiveManager.StartReceivingAsync();
-                        ReceiveStatusText = "等待接收文件...";
-                        ReceivePortText = $"监听端口: {_receiveManager.Port}";
-                        TransferStatusText = "接收模式已开启";
-                    }
-                    else
-                    {
-                        _receiveManager.StopReceiving();
-                        IncomingTransferVisible = false;
-                        DropZoneVisible = true;
-                        TransferStatusText = "等待传输...";
-                    }
-                }
-            }
-        }
+                    IsReceiving = true;
+                    OnPropertyChanged(nameof(ReceiverPort));
+                    AddLog($"Receiver active on port {ReceiverPort}");
+                });
 
-        public string ReceiveStatusText
-        {
-            get => _receiveStatusText;
-            private set => SetProperty(ref _receiveStatusText, value);
-        }
-
-        public string ReceivePortText
-        {
-            get => _receivePortText;
-            private set => SetProperty(ref _receivePortText, value);
-        }
-
-        public bool IncomingTransferVisible
-        {
-            get => _isIncomingTransferVisible;
-            private set => SetProperty(ref _isIncomingTransferVisible, value);
-        }
-
-        public bool DropZoneVisible
-        {
-            get => _isDropZoneVisible;
-            private set => SetProperty(ref _isDropZoneVisible, value);
-        }
-
-        public string TransferStatusText
-        {
-            get => _transferStatusText;
-            private set => SetProperty(ref _transferStatusText, value);
-        }
-
-        public double TransferProgress
-        {
-            get => _transferProgress;
-            private set => SetProperty(ref _transferProgress, value);
-        }
-
-        public DiscoveredPeer? SelectedPeer
-        {
-            get => _selectedPeer;
-            set => SetProperty(ref _selectedPeer, value);
-        }
-
-        public string IncomingFileName
-        {
-            get => _incomingFileName;
-            private set => SetProperty(ref _incomingFileName, value);
-        }
-
-        public string IncomingFileSize
-        {
-            get => _incomingFileSize;
-            private set => SetProperty(ref _incomingFileSize, value);
-        }
-
-        public string IncomingSender
-        {
-            get => _incomingSender;
-            private set => SetProperty(ref _incomingSender, value);
-        }
-
-        public async Task SendFilesAsync(string[] files)
-        {
-            if (files.Length == 0)
-            {
-                return;
-            }
-
-            if (SelectedPeer == null)
-            {
-                MessageBox.Show("请先选择目标设备", "提示", MessageBoxButton.OK, MessageBoxImage.Information);
-                return;
-            }
-
-            if (_transferManager.IsTransferring)
-            {
-                MessageBox.Show("正在传输中，请等待完成", "提示", MessageBoxButton.OK, MessageBoxImage.Information);
-                return;
-            }
-
-            foreach (var file in files)
-            {
-                TransferStatusText = $"正在发送: {System.IO.Path.GetFileName(file)}";
-                TransferProgress = 0;
-
-                try
+                // Start discovery with receiver port
+                var port = _engine.ReceiverPort > 0 ? _engine.ReceiverPort : (ushort)42424;
+                _engine.StartDiscovery(port);
+                
+                InvokeOnUI(() =>
                 {
-                    await _transferManager.SendFileAsync(file, SelectedPeer);
-                }
-                catch (Exception ex)
-                {
-                    MessageBox.Show($"传输错误: {ex.Message}", "错误", MessageBoxButton.OK, MessageBoxImage.Error);
-                    break;
-                }
+                    IsDiscovering = true;
+                    StatusMessage = "Scanning for devices...";
+                });
+
+                AddLog("Auto-discovery started");
+            }
+            catch (Exception ex)
+            {
+                AddLog($"Initialization error: {ex.Message}");
+                StatusMessage = "Init failed";
             }
         }
 
-        public void Dispose()
+        #endregion
+
+        #region Command Handlers
+
+        private void ToggleScan()
         {
-            _engine.PeersChanged -= OnPeersChanged;
-            _engine.DiscoveryStateChanged -= OnDiscoveryStateChanged;
-            _engine.DiscoveryDiagnosticsChanged -= OnDiscoveryDiagnosticsChanged;
-
-            _receiveManager.TransferRequested -= OnIncomingTransfer;
-            _receiveManager.ProgressChanged -= OnReceiveProgressChanged;
-            _receiveManager.TransferCompleted -= OnReceiveCompleted;
-            _receiveManager.StateChanged -= OnReceiverStateChanged;
-
-            _transferManager.ProgressChanged -= OnTransferProgressChanged;
-            _transferManager.TransferCompleted -= OnTransferCompleted;
-
-            _transferManager.Dispose();
-            _receiveManager.Dispose();
-            _engine.Dispose();
-        }
-
-        private void InitializeReceiving()
-        {
-            _ = _receiveManager.StartReceivingAsync();
-            _isReceiveModeEnabled = true;
-            OnPropertyChanged(nameof(IsReceiveModeEnabled));
-            ReceivePortText = $"监听端口: {_receiveManager.Port}";
-            TransferStatusText = "接收模式已开启";
-        }
-
-        private void ToggleDiscovery()
-        {
-            if (_engine.IsDiscovering)
+            if (IsDiscovering)
             {
                 _engine.StopDiscovery();
+                InvokeOnUI(() =>
+                {
+                    IsDiscovering = false;
+                    StatusMessage = "Scan stopped";
+                });
             }
             else
             {
-                StartDiscovery(_receiveManager.Port);
-            }
-        }
-
-        private void StartDiscovery(ushort port)
-        {
-            if (!_engine.StartDiscovery(port))
-            {
-                var diag = FirewallHelper.DiagnoseNetworkIssues();
-                var issuesSummary = diag.Issues.Count > 0
-                    ? "\n\n问题: " + string.Join("; ", diag.Issues)
-                    : "";
-
-                var result = MessageBox.Show(
-                    $"启动设备发现失败。{issuesSummary}\n\n是否查看网络诊断建议？",
-                    "发现失败",
-                    MessageBoxButton.YesNo,
-                    MessageBoxImage.Warning
-                );
-
-                if (result == MessageBoxResult.Yes)
+                var port = _engine.ReceiverPort > 0 ? _engine.ReceiverPort : (ushort)42424;
+                _engine.StartDiscovery(port);
+                InvokeOnUI(() =>
                 {
-                    FirewallHelper.ShowNetworkTroubleshootingDialog();
-                }
+                    IsDiscovering = true;
+                    StatusMessage = "Scanning...";
+                });
             }
         }
 
-        private void AddManualPeer()
+        private async Task SendFileAsync()
         {
-            if (!_engine.IsDiscovering)
+            if (SelectedPeer == null || !HasFileSelected)
             {
-                StartDiscovery(_receiveManager.Port);
-            }
-
-            var dialog = new ManualPeerDialog();
-            if (dialog.ShowDialog() == true)
-            {
-                var ipInput = dialog.IpAddress;
-                var port = dialog.Port;
-                var peerId = $"manual-{ipInput.Replace(".", "-")}";
-                var peerName = $"手动添加 ({ipInput})";
-
-                if (_engine.AddManualPeer(peerId, peerName, ipInput, port))
-                {
-                    MessageBox.Show($"已添加设备: {ipInput}:{port}", "成功", MessageBoxButton.OK, MessageBoxImage.Information);
-                }
-                else
-                {
-                    MessageBox.Show($"添加设备失败: {ipInput}:{port}", "错误", MessageBoxButton.OK, MessageBoxImage.Warning);
-                }
-            }
-        }
-
-        private void OpenDownloads()
-        {
-            var downloadPath = System.IO.Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-                "Downloads",
-                "VoidWarp"
-            );
-
-            if (!System.IO.Directory.Exists(downloadPath))
-            {
-                System.IO.Directory.CreateDirectory(downloadPath);
-            }
-
-            System.Diagnostics.Process.Start("explorer.exe", downloadPath);
-        }
-
-        private void TestConnection(DiscoveredPeer? peer)
-        {
-            if (peer == null)
-            {
-                MessageBox.Show("请先选择目标设备", "提示", MessageBoxButton.OK, MessageBoxImage.Information);
+                AddLog("Please select a file and target device");
                 return;
             }
 
-            var result = VoidWarpEngine.TestConnection(peer);
-            if (result)
+            InvokeOnUI(() =>
             {
-                MessageBox.Show($"设备在线！\n{peer.DeviceName} ({peer.BestIp}:{peer.Port})", 
-                    "连接测试", MessageBoxButton.OK, MessageBoxImage.Information);
+                IsSending = true;
+                ProgressValue = 0;
+                StatusMessage = $"Sending to {SelectedPeer.DeviceName}...";
+            });
+
+            try
+            {
+                await _engine.SendFileAsync(SelectedFilePath, SelectedPeer);
+            }
+            catch (Exception ex)
+            {
+                AddLog($"Send error: {ex.Message}");
+                InvokeOnUI(() => StatusMessage = "Send failed");
+            }
+            finally
+            {
+                InvokeOnUI(() => IsSending = false);
+            }
+        }
+
+        private void ToggleReceiver()
+        {
+            if (IsReceiving)
+            {
+                _engine.StopReceiver();
+                InvokeOnUI(() =>
+                {
+                    IsReceiving = false;
+                    StatusMessage = "Receiver stopped";
+                });
             }
             else
             {
-                var diagResult = MessageBox.Show(
-                    $"无法连接到设备: {peer.DeviceName}\nIP: {peer.IpAddress}\n端口: {peer.Port}\n\n" +
-                    "可能原因:\n• 设备不在同一局域网\n• 防火墙阻止了连接\n• 目标设备未开启接收模式\n\n是否查看网络诊断？",
-                    "连接失败",
-                    MessageBoxButton.YesNo,
-                    MessageBoxImage.Warning
-                );
-
-                if (diagResult == MessageBoxResult.Yes)
+                _engine.StartReceiver();
+                InvokeOnUI(() =>
                 {
-                    FirewallHelper.ShowNetworkTroubleshootingDialog();
-                }
+                    IsReceiving = true;
+                    StatusMessage = "Receiver active";
+                    OnPropertyChanged(nameof(ReceiverPort));
+                });
             }
         }
 
-        private async void AcceptPendingTransferAsync()
+        private void SelectFile()
         {
-            if (_pendingTransfer == null)
+            var dialog = new OpenFileDialog
             {
-                return;
-            }
-
-            var dialog = new SaveFileDialog
-            {
-                FileName = _pendingTransfer.FileName,
-                Title = "保存文件"
+                Title = "Select file to send",
+                Filter = "All Files (*.*)|*.*",
+                CheckFileExists = true
             };
 
             if (dialog.ShowDialog() == true)
             {
-                TransferStatusText = "正在接收...";
-                await _receiveManager.AcceptTransferAsync(dialog.FileName);
+                SelectedFilePath = dialog.FileName;
+                try
+                {
+                    var fileInfo = new FileInfo(dialog.FileName);
+                    AddLog($"Selected: {fileInfo.Name} ({FormatSize(fileInfo.Length)})");
+                }
+                catch
+                {
+                    AddLog($"Selected: {Path.GetFileName(dialog.FileName)}");
+                }
             }
         }
 
-        private void RejectPendingTransfer()
+        private void ClearLogs()
         {
-            _receiveManager.RejectTransfer();
-            IncomingTransferVisible = false;
-            DropZoneVisible = true;
-            ReceiveStatusText = "等待接收文件...";
-            _pendingTransfer = null;
-            IncomingFileName = "文件: -";
-            IncomingFileSize = "大小: -";
-            IncomingSender = "来自: -";
+            InvokeOnUI(() => Logs.Clear());
         }
 
-        private void OnPeersChanged(object? sender, PeersChangedEventArgs e)
+        private void TestConnection(PeerItem? peer)
         {
-            Application.Current.Dispatcher.Invoke(() =>
+            if (peer == null) return;
+
+            AddLog($"Testing connection to {peer.DeviceName}...");
+            StatusMessage = "Testing connection...";
+
+            Task.Run(() =>
             {
-                Debug.WriteLine($"[MainViewModel] Peers changed, count: {e.Count}");
+                bool result = _engine.TestConnection(peer);
+                InvokeOnUI(() =>
+                {
+                    if (result)
+                    {
+                        AddLog($"✓ {peer.DeviceName} is online and reachable");
+                        StatusMessage = "Connection OK";
+                        MessageBox.Show(
+                            $"Device is online!\n\n{peer.DeviceName}\n{peer.DisplayName}",
+                            "Connection Test",
+                            MessageBoxButton.OK,
+                            MessageBoxImage.Information);
+                    }
+                    else
+                    {
+                        AddLog($"✗ Cannot reach {peer.DeviceName}");
+                        StatusMessage = "Connection failed";
+                        MessageBox.Show(
+                            $"Cannot connect to {peer.DeviceName}\n\nMake sure:\n• Device is on the same network\n• Receiver is enabled on the device\n• Firewall allows connections",
+                            "Connection Failed",
+                            MessageBoxButton.OK,
+                            MessageBoxImage.Warning);
+                    }
+                });
+            });
+        }
+
+        private void OpenDownloadsFolder()
+        {
+            var path = GetDownloadsPath();
+            if (!Directory.Exists(path))
+            {
+                Directory.CreateDirectory(path);
+            }
+            
+            try
+            {
+                Process.Start("explorer.exe", path);
+            }
+            catch (Exception ex)
+            {
+                AddLog($"Failed to open folder: {ex.Message}");
+            }
+        }
+
+        private void ShowAddPeerDialog()
+        {
+            // Create a simple input dialog for manual peer addition
+            var dialog = new ManualPeerDialog();
+            dialog.Owner = Application.Current.MainWindow;
+            
+            if (dialog.ShowDialog() == true)
+            {
+                var ip = dialog.IpAddress;
+                var port = dialog.Port;
+                
+                if (!string.IsNullOrWhiteSpace(ip))
+                {
+                    var id = $"manual-{ip.Replace(".", "-")}";
+                    var name = $"Manual ({ip})";
+                    
+                    if (_engine.AddManualPeer(id, name, ip, port))
+                    {
+                        AddLog($"Added manual peer: {ip}:{port}");
+                    }
+                    else
+                    {
+                        AddLog($"Failed to add peer: {ip}:{port}");
+                    }
+                }
+            }
+        }
+
+        private void CancelTransfer()
+        {
+            _engine.CancelSend();
+            InvokeOnUI(() =>
+            {
+                IsSending = false;
+                ProgressValue = 0;
+                StatusMessage = "Transfer cancelled";
+            });
+        }
+
+        #endregion
+
+        #region Engine Event Handlers
+
+        private void Engine_OnLog(object? sender, LogEventArgs e)
+        {
+            AddLog($"[{e.Level}] {e.Message}");
+        }
+
+        private void Engine_OnPeerDiscovered(object? sender, PeerDiscoveredEventArgs e)
+        {
+            InvokeOnUI(() =>
+            {
+                // Preserve selection if possible
+                var selectedId = SelectedPeer?.DeviceId;
+                
                 Peers.Clear();
                 foreach (var peer in e.Peers)
                 {
                     Peers.Add(peer);
                 }
 
-                if (Peers.Count == 0)
+                // Restore selection
+                if (selectedId != null)
                 {
-                    DiscoveryStatusText = _engine.IsDiscovering ? "正在发现设备..." : "未发现设备";
+                    SelectedPeer = e.Peers.Find(p => p.DeviceId == selectedId);
+                }
+
+                if (e.Count > 0)
+                {
+                    StatusMessage = $"Found {e.Count} device(s)";
+                }
+                else if (IsDiscovering)
+                {
+                    StatusMessage = "Scanning...";
+                }
+            });
+        }
+
+        private void Engine_OnProgress(object? sender, ProgressEventArgs e)
+        {
+            InvokeOnUI(() =>
+            {
+                ProgressValue = e.Percentage;
+                StatusMessage = $"{e.Percentage:F1}% {e.FormattedSpeed}".Trim();
+            });
+        }
+
+        private void Engine_OnTransferComplete(object? sender, TransferCompleteEventArgs e)
+        {
+            InvokeOnUI(() =>
+            {
+                ProgressValue = e.Success ? 100 : 0;
+                IsSending = false;
+                _hasPendingTransfer = false;
+
+                if (e.Success)
+                {
+                    StatusMessage = "Transfer complete!";
+                    AddLog("✓ Transfer completed successfully");
+                    
+                    MessageBox.Show(
+                        "File transfer completed successfully!",
+                        "Success",
+                        MessageBoxButton.OK,
+                        MessageBoxImage.Information);
                 }
                 else
                 {
-                    DiscoveryStatusText = $"已发现 {Peers.Count} 个设备";
+                    StatusMessage = $"Failed: {e.ErrorMessage}";
+                    AddLog($"✗ Transfer failed: {e.ErrorMessage}");
+                    
+                    MessageBox.Show(
+                        $"Transfer failed:\n{e.ErrorMessage}",
+                        "Error",
+                        MessageBoxButton.OK,
+                        MessageBoxImage.Error);
                 }
             });
         }
 
-        private void OnDiscoveryStateChanged(object? sender, DiscoveryStateChangedEventArgs e)
+        private void Engine_OnPendingTransfer(object? sender, PendingTransferEventArgs e)
         {
-            Application.Current.Dispatcher.Invoke(() =>
+            InvokeOnUI(() =>
             {
-                Debug.WriteLine($"[MainViewModel] Discovery state changed: {e.State}");
-                DiscoveryDetailText = e.Message ?? string.Empty;
-
-                switch (e.State)
-                {
-                    case DiscoveryState.Discovering:
-                        DiscoveryStatusColor = new SolidColorBrush(Color.FromRgb(0x6c, 0x63, 0xff));
-                        DiscoveryStatusText = "正在发现设备...";
-                        DiscoveryButtonText = "停止发现";
-                        break;
-                    case DiscoveryState.Idle:
-                        DiscoveryStatusColor = new SolidColorBrush(Color.FromRgb(0x88, 0x88, 0x88));
-                        DiscoveryStatusText = "发现已停止";
-                        DiscoveryButtonText = "开始发现设备";
-                        break;
-                    case DiscoveryState.Starting:
-                        DiscoveryStatusColor = new SolidColorBrush(Color.FromRgb(0xff, 0x98, 0x00));
-                        DiscoveryStatusText = "正在启动发现...";
-                        DiscoveryButtonText = "正在启动...";
-                        break;
-                    case DiscoveryState.Error:
-                        DiscoveryStatusColor = new SolidColorBrush(Color.FromRgb(0xff, 0x52, 0x52));
-                        DiscoveryStatusText = $"发现错误: {e.Message ?? "未知错误"}";
-                        DiscoveryButtonText = "重试发现";
-                        // Optionally show diagnostic hint for errors
-                        DiscoveryDetailText = "点击右下角\"诊断\"按钮获取帮助";
-                        break;
-                }
-            });
-        }
-
-        private void OnDiscoveryDiagnosticsChanged(object? sender, DiscoveryDiagnosticsChangedEventArgs e)
-        {
-            Application.Current.Dispatcher.Invoke(() =>
-            {
-                LocalNetworkText = $"本机网络: {e.InterfaceName} / {e.LocalIpAddress}";
-                UpdateNetworkDiagnostics();
-            });
-        }
-
-        private void OnReceiverStateChanged(object? sender, ReceiverStateChangedEventArgs e)
-        {
-            Application.Current.Dispatcher.Invoke(() =>
-            {
-                switch (e.NewState)
-                {
-                    case ReceiverState.Listening:
-                        ReceiveStatusText = "等待接收文件...";
-                        break;
-                    case ReceiverState.AwaitingAccept:
-                        ReceiveStatusText = "收到传输请求！";
-                        break;
-                    case ReceiverState.Receiving:
-                        ReceiveStatusText = "正在接收...";
-                        break;
-                    case ReceiverState.Completed:
-                        ReceiveStatusText = "接收完成！";
-                        break;
-                    case ReceiverState.Error:
-                        ReceiveStatusText = "接收错误";
-                        break;
-                }
-            });
-        }
-
-        private void OnTransferProgressChanged(TransferProgressInfo progress)
-        {
-            Application.Current.Dispatcher.Invoke(() =>
-            {
-                TransferProgress = progress.Percentage;
-                TransferStatusText = $"{progress.FormattedProgress} ({progress.FormattedSpeed})";
-            });
-        }
-
-        private void OnTransferCompleted(bool success, string? error)
-        {
-            Application.Current.Dispatcher.Invoke(() =>
-            {
-                if (success)
-                {
-                    TransferStatusText = "传输完成！";
-                    TransferProgress = 100;
-                    MessageBox.Show("文件传输成功！", "完成", MessageBoxButton.OK, MessageBoxImage.Information);
-                }
-                else
-                {
-                    TransferStatusText = $"传输失败: {error}";
-                    MessageBox.Show($"传输失败: {error}", "错误", MessageBoxButton.OK, MessageBoxImage.Warning);
-                }
-            });
-        }
-
-        private void OnIncomingTransfer(PendingTransferInfo transfer)
-        {
-            Application.Current.Dispatcher.Invoke(() =>
-            {
-                _pendingTransfer = transfer;
-                IncomingTransferVisible = true;
-                DropZoneVisible = false;
-                ReceiveStatusText = "收到传输请求！";
-                IncomingFileName = $"文件: {transfer.FileName}";
-                IncomingFileSize = $"大小: {transfer.FormattedSize}";
-                IncomingSender = $"来自: {transfer.SenderName} ({transfer.SenderAddress})";
+                _hasPendingTransfer = true;
+                _pendingTransferInfo = e;
+                OnPropertyChanged(nameof(IsTransferring));
+                
+                AddLog($"Incoming: {e.FileName} ({e.FormattedSize}) from {e.SenderName}");
 
                 var result = MessageBox.Show(
-                    $"来自: {transfer.SenderName} ({transfer.SenderAddress})\n文件: {transfer.FileName}\n大小: {transfer.FormattedSize}\n\n是否接收？",
-                    "收到文件传输请求",
+                    $"Incoming file transfer\n\n" +
+                    $"From: {e.SenderName}\n" +
+                    $"Address: {e.SenderAddress}\n" +
+                    $"File: {e.FileName}\n" +
+                    $"Size: {e.FormattedSize}\n\n" +
+                    "Accept this transfer?",
+                    "File Transfer Request",
                     MessageBoxButton.YesNo,
-                    MessageBoxImage.Question
-                );
+                    MessageBoxImage.Question);
 
-                if (result == MessageBoxResult.No)
+                if (result == MessageBoxResult.Yes)
                 {
-                    RejectPendingTransfer();
-                }
-            });
-        }
-
-        private void OnReceiveProgressChanged(float progress)
-        {
-            Application.Current.Dispatcher.Invoke(() =>
-            {
-                TransferProgress = progress;
-                TransferStatusText = $"正在接收... {progress:F1}%";
-            });
-        }
-
-        private void OnReceiveCompleted(bool success, string? error)
-        {
-            Application.Current.Dispatcher.Invoke(() =>
-            {
-                IncomingTransferVisible = false;
-                DropZoneVisible = true;
-                IncomingFileName = "文件: -";
-                IncomingFileSize = "大小: -";
-                IncomingSender = "来自: -";
-
-                if (success)
-                {
-                    TransferStatusText = "接收完成！";
-                    TransferProgress = 100;
-                    MessageBox.Show("文件接收成功！", "完成", MessageBoxButton.OK, MessageBoxImage.Information);
+                    // Sanitize filename
+                    var safeName = SanitizeFileName(e.FileName);
+                    var savePath = Path.Combine(GetDownloadsPath(), safeName);
+                    
+                    if (_engine.AcceptTransfer(savePath))
+                    {
+                        AddLog($"Accepted, saving to: {savePath}");
+                        StatusMessage = "Receiving file...";
+                    }
+                    else
+                    {
+                        AddLog("Failed to accept transfer");
+                        StatusMessage = "Accept failed";
+                        _hasPendingTransfer = false;
+                    }
                 }
                 else
                 {
-                    TransferStatusText = $"接收失败: {error}";
-                    MessageBox.Show($"接收失败: {error}", "错误", MessageBoxButton.OK, MessageBoxImage.Warning);
+                    _engine.RejectTransfer();
+                    AddLog("Transfer rejected");
+                    StatusMessage = "Transfer rejected";
+                    _hasPendingTransfer = false;
                 }
-
-                ReceiveStatusText = "等待接收文件...";
+                
+                OnPropertyChanged(nameof(IsTransferring));
             });
         }
 
-        private void UpdateNetworkDiagnostics()
+        #endregion
+
+        #region Helpers
+
+        /// <summary>
+        /// CRITICAL: Execute action on UI thread to avoid cross-thread exceptions.
+        /// All ObservableCollection and property updates must go through this.
+        /// </summary>
+        private void InvokeOnUI(Action action)
         {
-            var ipSummary = string.Join(", ", NetworkDiagnosticsHelper.GetLocalIpSummaries());
-            LocalNetworkText = $"本机网络: {_engine.LocalInterfaceName} / {_engine.LocalIpAddress}";
-            var detail = string.IsNullOrWhiteSpace(_engine.DiscoveryDiagnosticsDetail)
-                ? "网络诊断"
-                : _engine.DiscoveryDiagnosticsDetail;
-            DiscoveryDetailText = $"{detail} | IP 列表: {ipSummary}";
-            ReceivePortText = $"监听端口: {_receiveManager.Port}";
+            if (Application.Current?.Dispatcher == null)
+            {
+                action();
+                return;
+            }
+
+            if (Application.Current.Dispatcher.CheckAccess())
+            {
+                action();
+            }
+            else
+            {
+                Application.Current.Dispatcher.Invoke(action);
+            }
+        }
+
+        /// <summary>
+        /// Add a timestamped log message (thread-safe).
+        /// </summary>
+        private void AddLog(string message)
+        {
+            InvokeOnUI(() =>
+            {
+                var timestamp = DateTime.Now.ToString("HH:mm:ss");
+                Logs.Add($"[{timestamp}] {message}");
+
+                // Keep log size manageable
+                while (Logs.Count > 500)
+                {
+                    Logs.RemoveAt(0);
+                }
+            });
+        }
+
+        /// <summary>
+        /// Get the downloads folder path.
+        /// </summary>
+        private static string GetDownloadsPath()
+        {
+            return Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                "Downloads",
+                "VoidWarp"
+            );
+        }
+
+        /// <summary>
+        /// Format file size for display.
+        /// </summary>
+        private static string FormatSize(long bytes)
+        {
+            return bytes switch
+            {
+                >= 1024L * 1024 * 1024 => $"{bytes / 1024.0 / 1024.0 / 1024.0:F2} GB",
+                >= 1024L * 1024 => $"{bytes / 1024.0 / 1024.0:F1} MB",
+                >= 1024 => $"{bytes / 1024.0:F1} KB",
+                _ => $"{bytes} B"
+            };
+        }
+
+        /// <summary>
+        /// Sanitize a filename by removing invalid characters.
+        /// </summary>
+        private static string SanitizeFileName(string fileName)
+        {
+            var invalid = Path.GetInvalidFileNameChars();
+            var safeName = new string(fileName
+                .Where(c => !invalid.Contains(c))
+                .ToArray());
+            
+            return string.IsNullOrWhiteSpace(safeName) ? "received_file" : safeName;
         }
 
         private bool SetProperty<T>(ref T storage, T value, [CallerMemberName] string? propertyName = null)
         {
-            if (Equals(storage, value))
-            {
-                return false;
-            }
-
+            if (Equals(storage, value)) return false;
             storage = value;
             OnPropertyChanged(propertyName);
             return true;
@@ -611,8 +796,36 @@ namespace VoidWarp.Windows.ViewModels
         {
             PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
         }
+
+        #endregion
+
+        #region IDisposable
+
+        public void Dispose()
+        {
+            if (_disposed) return;
+
+            // Unsubscribe from events
+            _engine.OnLog -= Engine_OnLog;
+            _engine.OnPeerDiscovered -= Engine_OnPeerDiscovered;
+            _engine.OnProgress -= Engine_OnProgress;
+            _engine.OnTransferComplete -= Engine_OnTransferComplete;
+            _engine.OnPendingTransfer -= Engine_OnPendingTransfer;
+
+            // Dispose engine
+            _engine.Dispose();
+            
+            _disposed = true;
+        }
+
+        #endregion
     }
 
+    #region RelayCommand
+
+    /// <summary>
+    /// Simple ICommand implementation for MVVM binding.
+    /// </summary>
     public sealed class RelayCommand : ICommand
     {
         private readonly Action<object?> _execute;
@@ -620,7 +833,7 @@ namespace VoidWarp.Windows.ViewModels
 
         public RelayCommand(Action<object?> execute, Func<object?, bool>? canExecute = null)
         {
-            _execute = execute;
+            _execute = execute ?? throw new ArgumentNullException(nameof(execute));
             _canExecute = canExecute;
         }
 
@@ -628,49 +841,12 @@ namespace VoidWarp.Windows.ViewModels
 
         public void Execute(object? parameter) => _execute(parameter);
 
-        public event EventHandler? CanExecuteChanged;
-
-        public void RaiseCanExecuteChanged()
+        public event EventHandler? CanExecuteChanged
         {
-            CanExecuteChanged?.Invoke(this, EventArgs.Empty);
+            add => CommandManager.RequerySuggested += value;
+            remove => CommandManager.RequerySuggested -= value;
         }
     }
 
-    public static class NetworkDiagnosticsHelper
-    {
-        public static IReadOnlyList<string> GetLocalIpSummaries()
-        {
-            var results = new List<string>();
-            try
-            {
-                var interfaces = System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces();
-                foreach (var ni in interfaces)
-                {
-                    if (ni.OperationalStatus != System.Net.NetworkInformation.OperationalStatus.Up ||
-                        ni.NetworkInterfaceType == System.Net.NetworkInformation.NetworkInterfaceType.Loopback)
-                    {
-                        continue;
-                    }
-
-                    var props = ni.GetIPProperties();
-                    foreach (var addr in props.UnicastAddresses)
-                    {
-                        if (addr.Address.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork)
-                        {
-                            continue;
-                        }
-
-                        var ip = addr.Address.ToString();
-                        results.Add($"{ni.Name}: {ip}");
-                    }
-                }
-            }
-            catch
-            {
-                return [];
-            }
-
-            return results;
-        }
-    }
+    #endregion
 }

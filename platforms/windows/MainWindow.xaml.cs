@@ -1,8 +1,15 @@
+using System;
+using System.Collections.Specialized;
 using System.Windows;
+using System.Windows.Threading;
 using VoidWarp.Windows.ViewModels;
 
 namespace VoidWarp.Windows
 {
+    /// <summary>
+    /// MainWindow code-behind.
+    /// Follows MVVM pattern - minimal logic here, all state in ViewModel.
+    /// </summary>
     public partial class MainWindow : Window
     {
         private readonly MainViewModel _viewModel;
@@ -10,35 +17,48 @@ namespace VoidWarp.Windows
         public MainWindow()
         {
             InitializeComponent();
+
+            // Create and bind ViewModel
             _viewModel = new MainViewModel();
             DataContext = _viewModel;
+
+            // Auto-scroll logs to bottom when new items are added
+            _viewModel.Logs.CollectionChanged += Logs_CollectionChanged;
         }
 
-        private void DropZone_DragOver(object sender, DragEventArgs e)
+        /// <summary>
+        /// Scroll log viewer to bottom when new log entries are added.
+        /// </summary>
+        private void Logs_CollectionChanged(object? sender, NotifyCollectionChangedEventArgs e)
         {
-            if (e.Data.GetDataPresent(DataFormats.FileDrop))
+            if (e.Action == NotifyCollectionChangedAction.Add)
             {
-                e.Effects = DragDropEffects.Copy;
-            }
-            else
-            {
-                e.Effects = DragDropEffects.None;
-            }
-            e.Handled = true;
-        }
-
-        private async void DropZone_Drop(object sender, DragEventArgs e)
-        {
-            if (e.Data.GetDataPresent(DataFormats.FileDrop))
-            {
-                string[] files = (string[])e.Data.GetData(DataFormats.FileDrop);
-                await _viewModel.SendFilesAsync(files);
+                // Use BeginInvoke with low priority to ensure UI has updated
+                Dispatcher.BeginInvoke(new Action(() =>
+                {
+                    try
+                    {
+                        LogScrollViewer?.ScrollToEnd();
+                    }
+                    catch
+                    {
+                        // Ignore scroll errors
+                    }
+                }), DispatcherPriority.Background);
             }
         }
 
+        /// <summary>
+        /// Cleanup when window is closed.
+        /// </summary>
         protected override void OnClosed(EventArgs e)
         {
+            // Unsubscribe from events
+            _viewModel.Logs.CollectionChanged -= Logs_CollectionChanged;
+            
+            // Dispose ViewModel (stops all operations, cleans up native handles)
             _viewModel.Dispose();
+            
             base.OnClosed(e);
         }
     }

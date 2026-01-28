@@ -1,349 +1,517 @@
+using System;
+using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Net.NetworkInformation;
+using System.Net.Sockets;
 using System.Runtime.InteropServices;
-using System.Threading;
-using System.Threading.Tasks;
 using System.Threading;
 using System.Threading.Tasks;
 using VoidWarp.Windows.Native;
 
 namespace VoidWarp.Windows.Core
 {
-    /// <summary>
-    /// Discovery state enum - mirrors Android's pattern
-    /// </summary>
-    public enum DiscoveryState
+    #region Event Args
+
+    public class LogEventArgs : EventArgs
     {
-        Idle,
-        Starting,
-        Discovering,
-        Error
+        public string Message { get; }
+        public LogLevel Level { get; }
+        public DateTime Timestamp { get; }
+
+        public LogEventArgs(string message, LogLevel level = LogLevel.Info)
+        {
+            Message = message;
+            Level = level;
+            Timestamp = DateTime.Now;
+        }
     }
 
-    /// <summary>
-    /// Event args for peers changed event
-    /// </summary>
-    public class PeersChangedEventArgs : EventArgs
+    public enum LogLevel { Debug, Info, Warning, Error }
+
+    public class PeerDiscoveredEventArgs : EventArgs
     {
-        public List<DiscoveredPeer> Peers { get; }
+        public List<PeerItem> Peers { get; }
         public int Count => Peers.Count;
 
-        public PeersChangedEventArgs(List<DiscoveredPeer> peers)
+        public PeerDiscoveredEventArgs(List<PeerItem> peers)
         {
-            Peers = peers;
+            Peers = peers ?? new List<PeerItem>();
         }
     }
+
+    public class ProgressEventArgs : EventArgs
+    {
+        public double Percentage { get; }
+        public string FormattedProgress { get; }
+        public string FormattedSpeed { get; }
+        public ulong BytesTransferred { get; }
+        public ulong TotalBytes { get; }
+
+        public ProgressEventArgs(double percentage, ulong bytesTransferred = 0, ulong totalBytes = 0, string speed = "")
+        {
+            Percentage = Math.Min(100, Math.Max(0, percentage));
+            BytesTransferred = bytesTransferred;
+            TotalBytes = totalBytes;
+            FormattedProgress = $"{Percentage:F1}%";
+            FormattedSpeed = speed;
+        }
+    }
+
+    public class TransferCompleteEventArgs : EventArgs
+    {
+        public bool Success { get; }
+        public string? ErrorMessage { get; }
+        public string? FilePath { get; }
+
+        public TransferCompleteEventArgs(bool success, string? errorMessage = null, string? filePath = null)
+        {
+            Success = success;
+            ErrorMessage = errorMessage;
+            FilePath = filePath;
+        }
+    }
+
+    public class PendingTransferEventArgs : EventArgs
+    {
+        public string FileName { get; }
+        public long FileSize { get; }
+        public string SenderName { get; }
+        public string SenderAddress { get; }
+        public string FormattedSize { get; }
+
+        public PendingTransferEventArgs(string fileName, long fileSize, string senderName, string senderAddress)
+        {
+            FileName = fileName ?? "unknown";
+            FileSize = fileSize;
+            SenderName = senderName ?? "unknown";
+            SenderAddress = senderAddress ?? "unknown";
+            FormattedSize = FormatFileSize(fileSize);
+        }
+
+        private static string FormatFileSize(long bytes)
+        {
+            return bytes switch
+            {
+                >= 1024L * 1024 * 1024 => $"{bytes / 1024.0 / 1024.0 / 1024.0:F2} GB",
+                >= 1024L * 1024 => $"{bytes / 1024.0 / 1024.0:F1} MB",
+                >= 1024 => $"{bytes / 1024.0:F1} KB",
+                _ => $"{bytes} B"
+            };
+        }
+    }
+
+    #endregion
+
+    #region Data Models
+
+    public class PeerItem
+    {
+        public string DeviceId { get; set; } = string.Empty;
+        public string DeviceName { get; set; } = string.Empty;
+        public string IpAddress { get; set; } = string.Empty;
+        public ushort Port { get; set; }
+
+        /// <summary>
+        /// Get the best (first) IP address for connection attempts.
+        /// </summary>
+        public string BestIp => IpAddress.Split(',').FirstOrDefault()?.Trim() ?? "";
+
+        /// <summary>
+        /// Get all IP addresses as a list (for multi-IP peers).
+        /// </summary>
+        public List<string> AllIps => IpAddress
+            .Split(',', StringSplitOptions.RemoveEmptyEntries)
+            .Select(ip => ip.Trim())
+            .Where(ip => !string.IsNullOrEmpty(ip))
+            .ToList();
+
+        /// <summary>
+        /// Display-friendly name showing IP:Port.
+        /// </summary>
+        public string DisplayName => $"{BestIp}:{Port}";
+
+        /// <summary>
+        /// Short device ID for display.
+        /// </summary>
+        public string ShortId => DeviceId.Length >= 8 ? DeviceId[..8].ToUpperInvariant() : DeviceId.ToUpperInvariant();
+
+        public override string ToString() => $"{DeviceName} ({DisplayName})";
+
+        public override bool Equals(object? obj) =>
+            obj is PeerItem other && DeviceId == other.DeviceId;
+
+        public override int GetHashCode() => DeviceId.GetHashCode();
+    }
+
+    #endregion
+
+    #region Receiver State Enum
+
+    public static class ReceiverState
+    {
+        public const int Idle = 0;
+        public const int Listening = 1;
+        public const int AwaitingAccept = 2;
+        public const int Receiving = 3;
+        public const int Completed = 4;
+        public const int Error = 5;
+    }
+
+    #endregion
 
     /// <summary>
-    /// Event args for discovery state changed event
-    /// </summary>
-    public class DiscoveryStateChangedEventArgs : EventArgs
-    {
-        public DiscoveryState State { get; }
-        public string? Message { get; }
-
-        public DiscoveryStateChangedEventArgs(DiscoveryState state, string? message = null)
-        {
-            State = state;
-            Message = message;
-        }
-    }
-
-    public class DiscoveryDiagnosticsChangedEventArgs : EventArgs
-    {
-        public string LocalIpAddress { get; }
-        public string InterfaceName { get; }
-        public string Detail { get; }
-
-        public DiscoveryDiagnosticsChangedEventArgs(string localIpAddress, string interfaceName, string detail)
-        {
-            LocalIpAddress = localIpAddress;
-            InterfaceName = interfaceName;
-            Detail = detail;
-        }
-    }
-
-    /// <summary>
-    /// High-level wrapper around the VoidWarp native library
-    /// Implements event-driven architecture similar to Android's StateFlow pattern
+    /// Singleton async wrapper for VoidWarp native library.
+    /// Mimics Android's TransferManager pattern with C# events.
+    /// Thread-safe with proper exception handling.
     /// </summary>
     public sealed class VoidWarpEngine : IDisposable
     {
+        #region Singleton
+
+        private static readonly Lazy<VoidWarpEngine> _instance = new(() => new VoidWarpEngine());
+        public static VoidWarpEngine Instance => _instance.Value;
+
+        #endregion
+
+        #region Fields
+
         private IntPtr _handle;
-        private bool _disposed = false;
-        private Timer? _refreshTimer;
-        private List<DiscoveredPeer> _lastPeers = new();
+        private IntPtr _receiverHandle;
+        private IntPtr _senderHandle;
+        private bool _disposed;
         private readonly object _lock = new();
-        private string? _discoveryMessage;
 
-        public string DeviceId { get; private set; } = string.Empty;
-        public string LocalIpAddress { get; private set; } = string.Empty;
-        public string LocalInterfaceName { get; private set; } = string.Empty;
-        public string DiscoveryDiagnosticsDetail { get; private set; } = string.Empty;
-        
-        private DiscoveryState _discoveryState = DiscoveryState.Idle;
-        public DiscoveryState DiscoveryState
+        private CancellationTokenSource? _discoveryCts;
+        private CancellationTokenSource? _receiverCts;
+        private CancellationTokenSource? _senderCts;
+
+        private Task? _discoveryTask;
+        private Task? _receiverTask;
+        private Task? _senderTask;
+
+        private List<PeerItem> _cachedPeers = new();
+        private string _currentDeviceId = string.Empty;
+
+        #endregion
+
+        #region Properties
+
+        /// <summary>
+        /// The unique device ID for this instance.
+        /// </summary>
+        public string DeviceId
         {
-            get => _discoveryState;
-            private set => UpdateDiscoveryState(value, _discoveryMessage);
-        }
-
-        public bool IsDiscovering => DiscoveryState == DiscoveryState.Discovering;
-
-        /// <summary>
-        /// Event fired when the list of discovered peers changes
-        /// </summary>
-        public event EventHandler<PeersChangedEventArgs>? PeersChanged;
-
-        /// <summary>
-        /// Event fired when the discovery state changes
-        /// </summary>
-        public event EventHandler<DiscoveryStateChangedEventArgs>? DiscoveryStateChanged;
-
-        /// <summary>
-        /// Event fired when discovery diagnostics change
-        /// </summary>
-        public event EventHandler<DiscoveryDiagnosticsChangedEventArgs>? DiscoveryDiagnosticsChanged;
-
-        public VoidWarpEngine(string deviceName = "Windows Device")
-        {
-            Debug.WriteLine($"[VoidWarpEngine] Initializing with device name: {deviceName}");
-            
-            _handle = NativeBindings.voidwarp_init(deviceName);
-            if (_handle == IntPtr.Zero)
-            {
-                Debug.WriteLine("[VoidWarpEngine] ERROR: Failed to initialize native handle");
-                throw new InvalidOperationException("Failed to initialize VoidWarp engine");
-            }
-
-            DeviceId = NativeBindings.GetStringAndFree(
-                NativeBindings.voidwarp_get_device_id(_handle)
-            ) ?? "unknown";
-            
-            LocalIpAddress = "unknown";
-            LocalInterfaceName = "unknown";
-            
-            Debug.WriteLine($"[VoidWarpEngine] Initialized successfully. DeviceId: {DeviceId}, LocalIP: {LocalIpAddress}");
+            get => _currentDeviceId;
+            private set => _currentDeviceId = value;
         }
 
         /// <summary>
-        /// Generate a new 6-digit pairing code
+        /// The device name (machine name).
         /// </summary>
-        public static string GeneratePairingCode()
-        {
-            return NativeBindings.GetStringAndFree(
-                NativeBindings.voidwarp_generate_pairing_code()
-            ) ?? "000-000";
-        }
+        public string DeviceName { get; } = Environment.MachineName;
 
         /// <summary>
-        /// Start mDNS discovery, advertising the specified receiver port
-        /// Automatically starts background peer refresh
+        /// Short device ID for UI display.
         /// </summary>
-        /// <param name="receiverPort">The port that the file receiver is listening on</param>
-        public bool StartDiscovery(ushort receiverPort)
+        public string ShortDeviceId => DeviceId.Length >= 8 
+            ? DeviceId[..8].ToUpperInvariant() 
+            : DeviceId.ToUpperInvariant();
+
+        /// <summary>
+        /// True if discovery is currently running.
+        /// </summary>
+        public bool IsDiscovering => _discoveryCts != null && !_discoveryCts.IsCancellationRequested;
+
+        /// <summary>
+        /// True if the receiver is currently running.
+        /// </summary>
+        public bool IsReceiving => _receiverHandle != IntPtr.Zero && _receiverCts != null && !_receiverCts.IsCancellationRequested;
+
+        /// <summary>
+        /// True if currently sending a file.
+        /// </summary>
+        public bool IsSending => _senderCts != null && !_senderCts.IsCancellationRequested;
+
+        /// <summary>
+        /// The port the receiver is listening on (0 if not active).
+        /// </summary>
+        public ushort ReceiverPort { get; private set; }
+
+        /// <summary>
+        /// True if the native library was loaded successfully.
+        /// </summary>
+        public bool NativeLoaded => NativeBindings.IsLoaded;
+
+        /// <summary>
+        /// Any error message from native library loading.
+        /// </summary>
+        public string? NativeLoadError => NativeBindings.LoadError;
+
+        /// <summary>
+        /// True if the engine is properly initialized.
+        /// </summary>
+        public bool IsInitialized => _handle != IntPtr.Zero;
+
+        #endregion
+
+        #region Events
+
+        /// <summary>
+        /// Fired when a log message is generated.
+        /// </summary>
+        public event EventHandler<LogEventArgs>? OnLog;
+
+        /// <summary>
+        /// Fired when peers are discovered or updated.
+        /// </summary>
+        public event EventHandler<PeerDiscoveredEventArgs>? OnPeerDiscovered;
+
+        /// <summary>
+        /// Fired when transfer progress updates.
+        /// </summary>
+        public event EventHandler<ProgressEventArgs>? OnProgress;
+
+        /// <summary>
+        /// Fired when a transfer completes (success or failure).
+        /// </summary>
+        public event EventHandler<TransferCompleteEventArgs>? OnTransferComplete;
+
+        /// <summary>
+        /// Fired when an incoming transfer is pending user acceptance.
+        /// </summary>
+        public event EventHandler<PendingTransferEventArgs>? OnPendingTransfer;
+
+        #endregion
+
+        #region Constructor & Initialization
+
+        private VoidWarpEngine()
         {
-            Debug.WriteLine($"[VoidWarpEngine] Starting discovery on port {receiverPort}...");
-            UpdateDiscoveryState(DiscoveryState.Starting, "正在选择本机网络接口...");
-            
+            Initialize();
+        }
+
+        private void Initialize()
+        {
             try
             {
-                var selector = new NetworkInterfaceSelector();
-                var selection = selector.SelectBestInterface();
-                var localIp = selection.IpAddress;
-                LocalIpAddress = localIp ?? "auto-detect";
-                LocalInterfaceName = selection.InterfaceName ?? "auto";
-                DiscoveryDiagnosticsDetail = selection.Reason;
+                Log($"Initializing VoidWarpEngine for '{DeviceName}'...", LogLevel.Info);
 
-                Debug.WriteLine($"[VoidWarpEngine] Local IP: {LocalIpAddress} (if={LocalInterfaceName})");
-                foreach (var candidate in selection.Candidates)
+                // Check if native library is available
+                if (!string.IsNullOrEmpty(NativeBindings.LoadError))
                 {
-                    Debug.WriteLine($"[VoidWarpEngine] Candidate: {candidate.InterfaceName} {candidate.IpAddress} score={candidate.Score} ({candidate.Reason})");
+                    Log($"Native library warning: {NativeBindings.LoadError}", LogLevel.Warning);
                 }
 
-                DiscoveryDiagnosticsChanged?.Invoke(
-                    this,
-                    new DiscoveryDiagnosticsChangedEventArgs(LocalIpAddress, LocalInterfaceName, DiscoveryDiagnosticsDetail)
-                );
+                // Initialize native handle
+                _handle = NativeBindings.voidwarp_init(DeviceName);
                 
-                int result = localIp == null
-                    ? NativeBindings.voidwarp_start_discovery(_handle, receiverPort)
-                    : NativeBindings.voidwarp_start_discovery_with_ip(_handle, receiverPort, localIp);
-                
-                Debug.WriteLine($"[VoidWarpEngine] Native discovery returned: {result}");
-                
-                // Auto-add localhost for USB/ADB forwarding scenarios
-                if (result == 0)
+                if (_handle == IntPtr.Zero)
                 {
-                    AddManualPeer("usb-android", "USB/Localhost", "127.0.0.1", receiverPort);
+                    Log("Failed to initialize native handle - DLL may not be loaded correctly", LogLevel.Error);
+                    return;
                 }
-                
-                // Start background refresh timer (every 1 second, like Android)
-                StartBackgroundRefresh();
-                
-                var modeHint = localIp == null
-                    ? "未找到优先接口，使用系统自动选择 (可能降级)"
-                    : $"使用接口 {LocalInterfaceName} / {LocalIpAddress}";
-                UpdateDiscoveryState(DiscoveryState.Discovering, modeHint);
-                Debug.WriteLine("[VoidWarpEngine] Discovery started successfully");
-                
-                // Trigger immediate refresh
-                RefreshPeersInternal();
-                
-                return true;
+
+                // Get device ID
+                var idPtr = NativeBindings.voidwarp_get_device_id(_handle);
+                DeviceId = NativeBindings.GetStringAndFree(idPtr) ?? Guid.NewGuid().ToString("N");
+
+                Log($"Engine initialized successfully. Device ID: {ShortDeviceId}", LogLevel.Info);
+            }
+            catch (DllNotFoundException ex)
+            {
+                Log($"Native library not found: {ex.Message}", LogLevel.Error);
             }
             catch (Exception ex)
             {
-                Debug.WriteLine($"[VoidWarpEngine] ERROR starting discovery: {ex.Message}");
-                UpdateDiscoveryState(DiscoveryState.Error, $"启动失败: {ex.Message}");
-                return false;
+                Log($"Initialization error: {ex.Message}", LogLevel.Error);
             }
         }
 
+        #endregion
+
+        #region Discovery
+
         /// <summary>
-        /// Manually add a peer (e.g. for USB connections)
+        /// Start device discovery on the network.
+        /// Runs in a background Task.Run loop, polling peers periodically.
         /// </summary>
-        public bool AddManualPeer(string id, string name, string ip, ushort port)
+        public void StartDiscovery(ushort port)
         {
-            Debug.WriteLine($"[VoidWarpEngine] Adding manual peer: {name} at {ip}:{port}");
-            var result = NativeBindings.voidwarp_add_manual_peer(_handle, id, name, ip, port);
-            
-            if (result == 0)
+            if (IsDiscovering)
             {
-                Debug.WriteLine("[VoidWarpEngine] Manual peer added successfully");
-                // Trigger immediate refresh to show the new peer
-                RefreshPeersInternal();
+                Log("Discovery already running", LogLevel.Warning);
+                return;
             }
-            else
+
+            if (_handle == IntPtr.Zero)
             {
-                Debug.WriteLine($"[VoidWarpEngine] Failed to add manual peer, result: {result}");
+                Log("Cannot start discovery - engine not initialized", LogLevel.Error);
+                return;
             }
-            
-            return result == 0;
+
+            _discoveryCts = new CancellationTokenSource();
+            var token = _discoveryCts.Token;
+
+            _discoveryTask = Task.Run(async () =>
+            {
+                try
+                {
+                    Log($"Starting discovery on port {port}...", LogLevel.Info);
+
+                    // Get local IP for mDNS binding
+                    var localIp = GetPrimaryLocalIp();
+                    Log($"Using local IP: {localIp}", LogLevel.Debug);
+
+                    // Start native discovery
+                    int result;
+                    if (!string.IsNullOrEmpty(localIp) && localIp != "127.0.0.1")
+                    {
+                        result = NativeBindings.voidwarp_start_discovery_with_ip(_handle, port, localIp);
+                    }
+                    else
+                    {
+                        result = NativeBindings.voidwarp_start_discovery(_handle, port);
+                    }
+
+                    if (result != 0)
+                    {
+                        Log($"Native discovery returned code {result} (may be running in fallback mode)", LogLevel.Warning);
+                    }
+
+                    Log("Discovery started - polling for peers...", LogLevel.Info);
+
+                    // Polling loop - refresh peers periodically
+                    while (!token.IsCancellationRequested)
+                    {
+                        RefreshPeers();
+                        await Task.Delay(1000, token);
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    Log("Discovery stopped by user", LogLevel.Info);
+                }
+                catch (DllNotFoundException ex)
+                {
+                    Log($"DLL error during discovery: {ex.Message}", LogLevel.Error);
+                }
+                catch (Exception ex)
+                {
+                    Log($"Discovery error: {ex.Message}", LogLevel.Error);
+                }
+            }, token);
         }
 
         /// <summary>
-        /// Stop mDNS discovery
+        /// Stop device discovery.
         /// </summary>
         public void StopDiscovery()
         {
-            Debug.WriteLine("[VoidWarpEngine] Stopping discovery...");
-            
-            StopBackgroundRefresh();
-            NativeBindings.voidwarp_stop_discovery(_handle);
-            
-            lock (_lock)
+            if (_discoveryCts == null) return;
+
+            try
             {
-                _lastPeers.Clear();
+                Log("Stopping discovery...", LogLevel.Info);
+                _discoveryCts.Cancel();
+                
+                if (_handle != IntPtr.Zero)
+                {
+                    NativeBindings.voidwarp_stop_discovery(_handle);
+                }
             }
-            
-            UpdateDiscoveryState(DiscoveryState.Idle, "发现已停止");
-            PeersChanged?.Invoke(this, new PeersChangedEventArgs(new List<DiscoveredPeer>()));
-            
-            Debug.WriteLine("[VoidWarpEngine] Discovery stopped");
+            catch (Exception ex)
+            {
+                Log($"Error stopping discovery: {ex.Message}", LogLevel.Warning);
+            }
+            finally
+            {
+                _discoveryCts?.Dispose();
+                _discoveryCts = null;
+            }
         }
 
         /// <summary>
-        /// Force a manual refresh of the peer list
+        /// Manually refresh the peer list from native code.
         /// </summary>
         public void RefreshPeers()
         {
-            RefreshPeersInternal();
-        }
+            if (_handle == IntPtr.Zero) return;
 
-        /// <summary>
-        /// Get list of discovered peers (current snapshot)
-        /// </summary>
-        public List<DiscoveredPeer> GetPeers()
-        {
-            lock (_lock)
-            {
-                return new List<DiscoveredPeer>(_lastPeers);
-            }
-        }
-
-        private void StartBackgroundRefresh()
-        {
-            StopBackgroundRefresh();
-            
-            Debug.WriteLine("[VoidWarpEngine] Starting background refresh timer (1s interval)");
-            _refreshTimer = new Timer(
-                _ => RefreshPeersInternal(),
-                null,
-                TimeSpan.Zero,
-                TimeSpan.FromSeconds(1)
-            );
-        }
-
-        private void StopBackgroundRefresh()
-        {
-            if (_refreshTimer != null)
-            {
-                Debug.WriteLine("[VoidWarpEngine] Stopping background refresh timer");
-                _refreshTimer.Dispose();
-                _refreshTimer = null;
-            }
-        }
-
-        private void RefreshPeersInternal()
-        {
-            if (_disposed || _handle == IntPtr.Zero) return;
-            
             try
             {
                 var peers = FetchPeersFromNative();
                 
-                bool changed = false;
-                lock (_lock)
-                {
-                    // Check if peers list has changed
-                    if (peers.Count != _lastPeers.Count)
-                    {
-                        changed = true;
-                    }
-                    else
-                    {
-                        for (int i = 0; i < peers.Count; i++)
-                        {
-                            if (peers[i].DeviceId != _lastPeers[i].DeviceId ||
-                                peers[i].IpAddress != _lastPeers[i].IpAddress ||
-                                peers[i].Port != _lastPeers[i].Port)
-                            {
-                                changed = true;
-                                break;
-                            }
-                        }
-                    }
-                    
-                    if (changed)
-                    {
-                        _lastPeers = peers;
-                    }
-                }
-                
+                // Filter out self
+                peers = peers.Where(p => p.DeviceId != DeviceId).ToList();
+
+                // Check if peers changed
+                bool changed = HasPeersChanged(peers);
+
                 if (changed)
                 {
-                    Debug.WriteLine($"[VoidWarpEngine] Peers changed, count: {peers.Count}");
-                    foreach (var peer in peers)
+                    lock (_lock)
                     {
-                        Debug.WriteLine($"  - {peer.DeviceName} ({peer.IpAddress}:{peer.Port})");
+                        _cachedPeers = peers;
                     }
+                    OnPeerDiscovered?.Invoke(this, new PeerDiscoveredEventArgs(peers));
                     
-                    // Fire event (UI should handle thread marshalling)
-                    PeersChanged?.Invoke(this, new PeersChangedEventArgs(peers));
+                    if (peers.Count > 0)
+                    {
+                        Log($"Discovered {peers.Count} peer(s)", LogLevel.Debug);
+                    }
                 }
             }
             catch (Exception ex)
             {
-                Debug.WriteLine($"[VoidWarpEngine] ERROR refreshing peers: {ex.Message}");
+                Log($"Error refreshing peers: {ex.Message}", LogLevel.Warning);
             }
         }
 
-        private List<DiscoveredPeer> FetchPeersFromNative()
+        /// <summary>
+        /// Add a manual peer for direct connection (USB/localhost).
+        /// </summary>
+        public bool AddManualPeer(string id, string name, string ip, ushort port)
         {
-            var result = new List<DiscoveredPeer>();
+            if (_handle == IntPtr.Zero)
+            {
+                Log("Cannot add peer - engine not initialized", LogLevel.Error);
+                return false;
+            }
+
+            try
+            {
+                int result = NativeBindings.voidwarp_add_manual_peer(_handle, id, name, ip, port);
+                if (result == 0)
+                {
+                    Log($"Added manual peer: {name} ({ip}:{port})", LogLevel.Info);
+                    RefreshPeers();
+                    return true;
+                }
+                else
+                {
+                    Log($"Failed to add manual peer (code: {result})", LogLevel.Warning);
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"Error adding manual peer: {ex.Message}", LogLevel.Error);
+            }
+            return false;
+        }
+
+        private List<PeerItem> FetchPeersFromNative()
+        {
+            var result = new List<PeerItem>();
             var list = NativeBindings.voidwarp_get_peers(_handle);
 
-            if (list.Peers != IntPtr.Zero && list.Count > 0)
+            if (list.Peers == IntPtr.Zero || list.Count == 0)
+            {
+                return result;
+            }
+
+            try
             {
                 int structSize = Marshal.SizeOf<NativeBindings.FfiPeer>();
                 for (nuint i = 0; i < list.Count; i++)
@@ -351,132 +519,574 @@ namespace VoidWarp.Windows.Core
                     IntPtr peerPtr = list.Peers + (int)(i * (nuint)structSize);
                     var ffiPeer = Marshal.PtrToStructure<NativeBindings.FfiPeer>(peerPtr);
 
-                    result.Add(new DiscoveredPeer
+                    var peer = new PeerItem
                     {
-                        DeviceId = Marshal.PtrToStringUTF8(ffiPeer.DeviceId) ?? "",
-                        DeviceName = Marshal.PtrToStringUTF8(ffiPeer.DeviceName) ?? "",
-                        IpAddress = Marshal.PtrToStringUTF8(ffiPeer.IpAddress) ?? "",
+                        DeviceId = NativeBindings.GetString(ffiPeer.DeviceId) ?? "",
+                        DeviceName = NativeBindings.GetString(ffiPeer.DeviceName) ?? "",
+                        IpAddress = NativeBindings.GetString(ffiPeer.IpAddress) ?? "",
                         Port = ffiPeer.Port
-                    });
-                }
+                    };
 
+                    if (!string.IsNullOrEmpty(peer.DeviceId))
+                    {
+                        result.Add(peer);
+                    }
+                }
+            }
+            finally
+            {
                 NativeBindings.voidwarp_free_peer_list(list);
             }
 
             return result;
         }
 
-        public static bool TestConnection(DiscoveredPeer peer)
+        private bool HasPeersChanged(List<PeerItem> newPeers)
         {
-            Debug.WriteLine($"[VoidWarpEngine] Testing connection to {peer.DeviceName}...");
-            
-            var ips = (peer.IpAddress ?? string.Empty).Split(',', StringSplitOptions.RemoveEmptyEntries);
-            foreach (var ip in ips)
+            lock (_lock)
             {
-                Debug.WriteLine($"[VoidWarpEngine] Trying {ip.Trim()}:{peer.Port}...");
-                if (NativeBindings.voidwarp_transport_ping(ip.Trim(), peer.Port))
+                if (newPeers.Count != _cachedPeers.Count) return true;
+                
+                for (int i = 0; i < newPeers.Count; i++)
                 {
-                    Debug.WriteLine($"[VoidWarpEngine] Connection test PASSED for {ip.Trim()}");
-                    return true;
+                    var newPeer = newPeers[i];
+                    var oldPeer = _cachedPeers.FirstOrDefault(p => p.DeviceId == newPeer.DeviceId);
+                    
+                    if (oldPeer == null ||
+                        oldPeer.IpAddress != newPeer.IpAddress ||
+                        oldPeer.Port != newPeer.Port)
+                    {
+                        return true;
+                    }
                 }
             }
-            
-            Debug.WriteLine($"[VoidWarpEngine] Connection test FAILED for all IPs");
             return false;
         }
 
-        private void UpdateDiscoveryState(DiscoveryState newState, string? message)
+        #endregion
+
+        #region File Sending
+
+        /// <summary>
+        /// Send a file to a peer asynchronously.
+        /// Tries all available IPs until one succeeds.
+        /// </summary>
+        public async Task SendFileAsync(string filePath, PeerItem peer)
         {
-            if (_discoveryState != newState || _discoveryMessage != message)
+            if (IsSending)
             {
-                _discoveryState = newState;
-                _discoveryMessage = message;
-                Debug.WriteLine($"[VoidWarpEngine] Discovery state changed: {newState} ({message})");
-                DiscoveryStateChanged?.Invoke(this, new DiscoveryStateChangedEventArgs(newState, message));
+                Log("Already sending a file", LogLevel.Warning);
+                return;
+            }
+
+            if (!File.Exists(filePath))
+            {
+                Log($"File not found: {filePath}", LogLevel.Error);
+                OnTransferComplete?.Invoke(this, new TransferCompleteEventArgs(false, "File not found"));
+                return;
+            }
+
+            _senderCts = new CancellationTokenSource();
+            var token = _senderCts.Token;
+
+            _senderTask = Task.Run(async () =>
+            {
+                IntPtr senderHandle = IntPtr.Zero;
+                
+                try
+                {
+                    var fileName = Path.GetFileName(filePath);
+                    var fileSize = new FileInfo(filePath).Length;
+                    Log($"Sending: {fileName} ({FormatSize(fileSize)}) -> {peer.DeviceName}", LogLevel.Info);
+
+                    // Create sender
+                    senderHandle = NativeBindings.voidwarp_tcp_sender_create(filePath);
+                    if (senderHandle == IntPtr.Zero)
+                    {
+                        Log("Failed to create sender handle", LogLevel.Error);
+                        OnTransferComplete?.Invoke(this, new TransferCompleteEventArgs(false, "Failed to create sender"));
+                        return;
+                    }
+
+                    _senderHandle = senderHandle;
+
+                    // Start progress monitoring
+                    var progressTask = MonitorSendProgressAsync(senderHandle, (ulong)fileSize, token);
+
+                    // Try each IP address until success
+                    int result = -1;
+                    string? successIp = null;
+
+                    foreach (var ip in peer.AllIps)
+                    {
+                        if (token.IsCancellationRequested) break;
+                        if (string.IsNullOrWhiteSpace(ip)) continue;
+
+                        Log($"Trying {ip}:{peer.Port}...", LogLevel.Debug);
+                        
+                        result = NativeBindings.voidwarp_tcp_sender_start(senderHandle, ip, peer.Port, DeviceName);
+
+                        if (result == 0)
+                        {
+                            successIp = ip;
+                            Log($"Transfer completed via {ip}", LogLevel.Info);
+                            break;
+                        }
+                        else if (result == 3) // Connection failed, try next IP
+                        {
+                            Log($"Connection failed to {ip}, trying next...", LogLevel.Debug);
+                            continue;
+                        }
+                        else
+                        {
+                            // Fatal error, don't try other IPs
+                            break;
+                        }
+                    }
+
+                    // Wait for progress monitoring to finish
+                    try { await progressTask; } catch { }
+
+                    // Interpret result
+                    var (success, error) = InterpretSendResult(result);
+                    
+                    OnProgress?.Invoke(this, new ProgressEventArgs(success ? 100 : 0));
+                    OnTransferComplete?.Invoke(this, new TransferCompleteEventArgs(success, error, filePath));
+                    
+                    Log(success ? "Transfer completed successfully" : $"Transfer failed: {error}", 
+                        success ? LogLevel.Info : LogLevel.Error);
+                }
+                catch (OperationCanceledException)
+                {
+                    Log("Transfer cancelled by user", LogLevel.Info);
+                    OnTransferComplete?.Invoke(this, new TransferCompleteEventArgs(false, "Cancelled"));
+                }
+                catch (DllNotFoundException ex)
+                {
+                    Log($"DLL error: {ex.Message}", LogLevel.Error);
+                    OnTransferComplete?.Invoke(this, new TransferCompleteEventArgs(false, "Native library error"));
+                }
+                catch (Exception ex)
+                {
+                    Log($"Send error: {ex.Message}", LogLevel.Error);
+                    OnTransferComplete?.Invoke(this, new TransferCompleteEventArgs(false, ex.Message));
+                }
+                finally
+                {
+                    // Cleanup sender
+                    if (senderHandle != IntPtr.Zero)
+                    {
+                        NativeBindings.voidwarp_tcp_sender_destroy(senderHandle);
+                    }
+                    _senderHandle = IntPtr.Zero;
+                    _senderCts?.Dispose();
+                    _senderCts = null;
+                }
+            }, token);
+
+            await _senderTask;
+        }
+
+        private async Task MonitorSendProgressAsync(IntPtr sender, ulong totalBytes, CancellationToken token)
+        {
+            try
+            {
+                while (!token.IsCancellationRequested && sender != IntPtr.Zero)
+                {
+                    float progress = NativeBindings.voidwarp_tcp_sender_get_progress(sender);
+                    OnProgress?.Invoke(this, new ProgressEventArgs(progress, (ulong)(progress / 100.0 * totalBytes), totalBytes));
+                    
+                    if (progress >= 100) break;
+                    await Task.Delay(200, token);
+                }
+            }
+            catch (OperationCanceledException) { }
+            catch { }
+        }
+
+        private (bool success, string? error) InterpretSendResult(int result)
+        {
+            return result switch
+            {
+                0 => (true, null),
+                1 => (false, "Transfer rejected by receiver"),
+                2 => (false, "Checksum verification failed"),
+                3 => (false, "Connection failed - check if receiver is online"),
+                4 => (false, "Transfer timed out"),
+                5 => (false, "Transfer was cancelled"),
+                6 => (false, "IO error during transfer"),
+                -1 => (false, "Invalid sender handle"),
+                _ => (false, $"Unknown error (code: {result})")
+            };
+        }
+
+        /// <summary>
+        /// Cancel the current send operation.
+        /// </summary>
+        public void CancelSend()
+        {
+            if (_senderHandle != IntPtr.Zero)
+            {
+                NativeBindings.voidwarp_tcp_sender_cancel(_senderHandle);
+            }
+            _senderCts?.Cancel();
+            Log("Send cancelled", LogLevel.Info);
+        }
+
+        #endregion
+
+        #region File Receiving
+
+        /// <summary>
+        /// Start the receiver to listen for incoming transfers.
+        /// </summary>
+        public void StartReceiver()
+        {
+            if (IsReceiving)
+            {
+                Log("Receiver already running", LogLevel.Warning);
+                return;
+            }
+
+            _receiverCts = new CancellationTokenSource();
+            var token = _receiverCts.Token;
+
+            _receiverTask = Task.Run(async () =>
+            {
+                try
+                {
+                    // Create receiver
+                    _receiverHandle = NativeBindings.voidwarp_create_receiver();
+                    if (_receiverHandle == IntPtr.Zero)
+                    {
+                        Log("Failed to create receiver", LogLevel.Error);
+                        return;
+                    }
+
+                    // Get assigned port
+                    ReceiverPort = NativeBindings.voidwarp_receiver_get_port(_receiverHandle);
+                    Log($"Receiver created on port {ReceiverPort}", LogLevel.Info);
+
+                    // Start listening
+                    NativeBindings.voidwarp_receiver_start(_receiverHandle);
+                    Log("Receiver listening for connections...", LogLevel.Info);
+
+                    // Polling loop to check receiver state
+                    while (!token.IsCancellationRequested && _receiverHandle != IntPtr.Zero)
+                    {
+                        int state = NativeBindings.voidwarp_receiver_get_state(_receiverHandle);
+                        
+                        await HandleReceiverState(state, token);
+                        await Task.Delay(200, token);
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    Log("Receiver stopped by user", LogLevel.Info);
+                }
+                catch (DllNotFoundException ex)
+                {
+                    Log($"DLL error: {ex.Message}", LogLevel.Error);
+                }
+                catch (Exception ex)
+                {
+                    Log($"Receiver error: {ex.Message}", LogLevel.Error);
+                }
+                finally
+                {
+                    CleanupReceiver();
+                }
+            }, token);
+        }
+
+        private async Task HandleReceiverState(int state, CancellationToken token)
+        {
+            switch (state)
+            {
+                case ReceiverState.AwaitingAccept:
+                    // Get pending transfer info
+                    var pending = NativeBindings.voidwarp_receiver_get_pending(_receiverHandle);
+                    if (pending.IsValid)
+                    {
+                        var fileName = NativeBindings.GetString(pending.FileName) ?? "unknown";
+                        var senderName = NativeBindings.GetString(pending.SenderName) ?? "unknown";
+                        var senderAddr = NativeBindings.GetString(pending.SenderAddr) ?? "unknown";
+                        
+                        Log($"Incoming transfer: {fileName} from {senderName}", LogLevel.Info);
+                        OnPendingTransfer?.Invoke(this, new PendingTransferEventArgs(
+                            fileName, (long)pending.FileSize, senderName, senderAddr));
+                        
+                        NativeBindings.voidwarp_free_pending_transfer(pending);
+                        
+                        // Wait a bit before polling again to avoid spamming the event
+                        await Task.Delay(1000, token);
+                    }
+                    break;
+
+                case ReceiverState.Receiving:
+                    float progress = NativeBindings.voidwarp_receiver_get_progress(_receiverHandle);
+                    ulong received = NativeBindings.voidwarp_receiver_get_bytes_received(_receiverHandle);
+                    OnProgress?.Invoke(this, new ProgressEventArgs(progress, received, 0));
+                    break;
+
+                case ReceiverState.Completed:
+                    Log("File received successfully", LogLevel.Info);
+                    OnProgress?.Invoke(this, new ProgressEventArgs(100));
+                    OnTransferComplete?.Invoke(this, new TransferCompleteEventArgs(true));
+                    
+                    // Reset receiver to listen for more transfers
+                    NativeBindings.voidwarp_receiver_start(_receiverHandle);
+                    break;
+
+                case ReceiverState.Error:
+                    Log("Receive error occurred", LogLevel.Error);
+                    OnTransferComplete?.Invoke(this, new TransferCompleteEventArgs(false, "Receive error"));
+                    
+                    // Reset receiver
+                    NativeBindings.voidwarp_receiver_start(_receiverHandle);
+                    break;
             }
         }
+
+        /// <summary>
+        /// Accept a pending incoming transfer.
+        /// </summary>
+        public bool AcceptTransfer(string savePath)
+        {
+            if (_receiverHandle == IntPtr.Zero)
+            {
+                Log("Cannot accept - receiver not active", LogLevel.Error);
+                return false;
+            }
+
+            try
+            {
+                // Ensure directory exists
+                var dir = Path.GetDirectoryName(savePath);
+                if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
+                {
+                    Directory.CreateDirectory(dir);
+                }
+
+                int result = NativeBindings.voidwarp_receiver_accept(_receiverHandle, savePath);
+                if (result == 0)
+                {
+                    Log($"Transfer accepted, saving to: {savePath}", LogLevel.Info);
+                    return true;
+                }
+                else
+                {
+                    Log($"Failed to accept transfer (code: {result})", LogLevel.Error);
+                    return false;
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"Accept error: {ex.Message}", LogLevel.Error);
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Reject a pending incoming transfer.
+        /// </summary>
+        public void RejectTransfer()
+        {
+            if (_receiverHandle == IntPtr.Zero) return;
+
+            try
+            {
+                NativeBindings.voidwarp_receiver_reject(_receiverHandle);
+                Log("Transfer rejected", LogLevel.Info);
+            }
+            catch (Exception ex)
+            {
+                Log($"Reject error: {ex.Message}", LogLevel.Warning);
+            }
+        }
+
+        /// <summary>
+        /// Stop the receiver.
+        /// </summary>
+        public void StopReceiver()
+        {
+            _receiverCts?.Cancel();
+            
+            if (_receiverHandle != IntPtr.Zero)
+            {
+                try { NativeBindings.voidwarp_receiver_stop(_receiverHandle); }
+                catch { }
+            }
+            
+            Log("Receiver stopping...", LogLevel.Info);
+        }
+
+        private void CleanupReceiver()
+        {
+            if (_receiverHandle != IntPtr.Zero)
+            {
+                try { NativeBindings.voidwarp_destroy_receiver(_receiverHandle); }
+                catch { }
+                finally { _receiverHandle = IntPtr.Zero; }
+            }
+            
+            ReceiverPort = 0;
+            _receiverCts?.Dispose();
+            _receiverCts = null;
+        }
+
+        #endregion
+
+        #region Utility Methods
+
+        /// <summary>
+        /// Test if a peer is reachable.
+        /// </summary>
+        public bool TestConnection(PeerItem peer)
+        {
+            try
+            {
+                foreach (var ip in peer.AllIps)
+                {
+                    if (string.IsNullOrWhiteSpace(ip)) continue;
+                    
+                    if (NativeBindings.voidwarp_transport_ping(ip, peer.Port))
+                    {
+                        Log($"Connection test passed: {ip}:{peer.Port}", LogLevel.Info);
+                        return true;
+                    }
+                }
+                Log($"Connection test failed for {peer.DeviceName}", LogLevel.Warning);
+            }
+            catch (Exception ex)
+            {
+                Log($"Connection test error: {ex.Message}", LogLevel.Warning);
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// Get the primary local IP address for network operations.
+        /// </summary>
+        public static string GetPrimaryLocalIp()
+        {
+            try
+            {
+                foreach (var ni in NetworkInterface.GetAllNetworkInterfaces())
+                {
+                    if (ni.OperationalStatus != OperationalStatus.Up ||
+                        ni.NetworkInterfaceType == NetworkInterfaceType.Loopback)
+                        continue;
+
+                    // Prioritize WiFi and Ethernet
+                    var name = ni.Name.ToLowerInvariant();
+                    bool isPriority = name.Contains("wi-fi") || name.Contains("wifi") || 
+                                     name.Contains("ethernet") || name.Contains("eth");
+
+                    foreach (var addr in ni.GetIPProperties().UnicastAddresses)
+                    {
+                        if (addr.Address.AddressFamily == AddressFamily.InterNetwork)
+                        {
+                            var ip = addr.Address.ToString();
+                            if (ip.StartsWith("192.168.") || ip.StartsWith("10.") || ip.StartsWith("172."))
+                            {
+                                if (isPriority) return ip;
+                            }
+                        }
+                    }
+                }
+
+                // Fallback: return first non-loopback IPv4
+                foreach (var ni in NetworkInterface.GetAllNetworkInterfaces())
+                {
+                    if (ni.OperationalStatus != OperationalStatus.Up) continue;
+                    
+                    foreach (var addr in ni.GetIPProperties().UnicastAddresses)
+                    {
+                        if (addr.Address.AddressFamily == AddressFamily.InterNetwork &&
+                            !addr.Address.ToString().StartsWith("127."))
+                        {
+                            return addr.Address.ToString();
+                        }
+                    }
+                }
+            }
+            catch { }
+            
+            return "127.0.0.1";
+        }
+
+        /// <summary>
+        /// Get all local IP addresses with interface names.
+        /// </summary>
+        public static List<string> GetAllLocalIpAddresses()
+        {
+            var ips = new List<string>();
+            try
+            {
+                foreach (var ni in NetworkInterface.GetAllNetworkInterfaces())
+                {
+                    if (ni.OperationalStatus != OperationalStatus.Up ||
+                        ni.NetworkInterfaceType == NetworkInterfaceType.Loopback)
+                        continue;
+
+                    foreach (var addr in ni.GetIPProperties().UnicastAddresses)
+                    {
+                        if (addr.Address.AddressFamily == AddressFamily.InterNetwork)
+                        {
+                            ips.Add($"{ni.Name}: {addr.Address}");
+                        }
+                    }
+                }
+            }
+            catch { }
+            return ips;
+        }
+
+        private static string FormatSize(long bytes)
+        {
+            return bytes switch
+            {
+                >= 1024L * 1024 * 1024 => $"{bytes / 1024.0 / 1024.0 / 1024.0:F2} GB",
+                >= 1024L * 1024 => $"{bytes / 1024.0 / 1024.0:F1} MB",
+                >= 1024 => $"{bytes / 1024.0:F1} KB",
+                _ => $"{bytes} B"
+            };
+        }
+
+        private void Log(string message, LogLevel level)
+        {
+            Debug.WriteLine($"[VoidWarpEngine] [{level}] {message}");
+            OnLog?.Invoke(this, new LogEventArgs(message, level));
+        }
+
+        #endregion
+
+        #region IDisposable
 
         public void Dispose()
         {
-            if (!_disposed)
+            if (_disposed) return;
+
+            Log("Disposing VoidWarpEngine...", LogLevel.Info);
+
+            // Stop all operations
+            StopDiscovery();
+            StopReceiver();
+            CancelSend();
+
+            // Destroy main handle
+            if (_handle != IntPtr.Zero)
             {
-                Debug.WriteLine("[VoidWarpEngine] Disposing...");
-                
-                StopBackgroundRefresh();
-                
-                if (_handle != IntPtr.Zero)
-                {
-                    NativeBindings.voidwarp_destroy(_handle);
-                    _handle = IntPtr.Zero;
-                }
-                _disposed = true;
-                
-                Debug.WriteLine("[VoidWarpEngine] Disposed");
+                try { NativeBindings.voidwarp_destroy(_handle); }
+                catch { }
+                finally { _handle = IntPtr.Zero; }
             }
-        }
-    }
 
-    internal static class NativeAsync
-    {
-        public static Task<int> StartTcpSenderAsync(
-            IntPtr sender,
-            string ipAddress,
-            ushort port,
-            string senderName,
-            CancellationToken cancellationToken
-        )
-        {
-            return Task.Run(
-                () => NativeBindings.voidwarp_tcp_sender_start(sender, ipAddress, port, senderName),
-                cancellationToken
-            );
+            _disposed = true;
+            Log("Engine disposed", LogLevel.Info);
         }
 
-        public static Task StartReceiverAsync(IntPtr receiver, CancellationToken cancellationToken = default)
-        {
-            return Task.Run(() => NativeBindings.voidwarp_receiver_start(receiver), cancellationToken);
-        }
-    }
-
-    /// <summary>
-    /// Represents a discovered peer on the network
-    /// </summary>
-    public class DiscoveredPeer
-    {
-        public string DeviceId { get; set; } = string.Empty;
-        public string DeviceName { get; set; } = string.Empty;
-        public string IpAddress { get; set; } = string.Empty;  // Can be comma-separated list
-        public ushort Port { get; set; }
-
-        /// <summary>
-        /// Get the best (first) IP address from the list
-        /// </summary>
-        public string BestIp => IpAddress.Split(',').FirstOrDefault()?.Trim() ?? "";
-
-        /// <summary>
-        /// Get all IP addresses as a list
-        /// </summary>
-        public List<string> AllIps => IpAddress
-            .Split(',', StringSplitOptions.RemoveEmptyEntries)
-            .Select(ip => ip.Trim())
-            .ToList();
-
-        /// <summary>
-        /// Display name for UI (shows first IP if multiple)
-        /// </summary>
-        public string DisplayName
-        {
-            get
-            {
-                var ips = AllIps;
-                if (ips.Count > 1)
-                {
-                    return $"{DeviceName} ({ips[0]}...)";
-                }
-                return $"{DeviceName} ({IpAddress})";
-            }
-        }
-
-        public override string ToString() => $"{DeviceName} ({IpAddress}:{Port})";
+        #endregion
     }
 }

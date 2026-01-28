@@ -15,8 +15,8 @@
 *   **🔒 端到端加密**: 采用 ECDH 密钥交换和 AES-256 加密，确保传输内容绝不泄露。
 *   **🔍 自动发现**: 基于 mDNS 的零配置设备发现，打开应用即可看到周围设备。
 *   **📱 全平台支持**:
-    *   **Windows**: WPF 现代化暗色主题界面 (已发布)
-    *   **Android**: Jetpack Compose 原生体验 (开发中)
+    *   **Windows**: WPF 现代化暗色主题界面 (开发中)
+    *   **Android**: Jetpack Compose 原生体验 (已完成)
     *   **macOS / iOS**: 计划中
 
 ## 🛠️ 安装与使用 (Usage)
