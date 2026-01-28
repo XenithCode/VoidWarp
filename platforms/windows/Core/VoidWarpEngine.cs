@@ -1,5 +1,9 @@
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Threading;
+using System.Threading.Tasks;
 using VoidWarp.Windows.Native;
 
 namespace VoidWarp.Windows.Core
@@ -409,6 +413,28 @@ namespace VoidWarp.Windows.Core
                 
                 Debug.WriteLine("[VoidWarpEngine] Disposed");
             }
+        }
+    }
+
+    internal static class NativeAsync
+    {
+        public static Task<int> StartTcpSenderAsync(
+            IntPtr sender,
+            string ipAddress,
+            ushort port,
+            string senderName,
+            CancellationToken cancellationToken
+        )
+        {
+            return Task.Run(
+                () => NativeBindings.voidwarp_tcp_sender_start(sender, ipAddress, port, senderName),
+                cancellationToken
+            );
+        }
+
+        public static Task StartReceiverAsync(IntPtr receiver, CancellationToken cancellationToken = default)
+        {
+            return Task.Run(() => NativeBindings.voidwarp_receiver_start(receiver), cancellationToken);
         }
     }
 

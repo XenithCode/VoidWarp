@@ -127,6 +127,26 @@ class ReceiveManager {
     }
     
     /**
+     * Start listening and suspend until ready (port assigned)
+     */
+    suspend fun ensureStarted(): Int {
+        if (_state.value == ReceiverState.LISTENING && _port.value > 0) {
+            return _port.value
+        }
+        
+        startReceiving()
+        
+        // Wait for port (max 2 seconds)
+        var attempts = 0
+        while (_port.value <= 0 && attempts < 20) {
+            delay(100)
+            attempts++
+        }
+        
+        return _port.value
+    }
+
+    /**
      * Start listening for incoming transfers
      * Automatically calls initialize() if not already done
      */
@@ -145,11 +165,9 @@ class ReceiveManager {
             android.util.Log.i("ReceiveManager", "Starting receiver on port ${_port.value}...")
             NativeLib.voidwarpReceiverStart(receiverHandle)
             
-            // Note: FileReceiverServer already binds to the port internally,
-            // so we don't need to call voidwarpTransportStartServer here.
-            // That would cause a port conflict and fail.
             _state.value = ReceiverState.LISTENING
             android.util.Log.i("ReceiveManager", "Receiver now LISTENING on port ${_port.value}")
+            _port.value = NativeLib.voidwarpReceiverGetPort(receiverHandle) // Refresh port just in case
             
             startPolling()
         } catch (t: Throwable) {

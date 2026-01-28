@@ -59,13 +59,13 @@ namespace VoidWarp.Windows.Core
                 int result = 3;
                 foreach (var ip in ipCandidates)
                 {
-                    result = await Task.Run(() =>
-                        NativeBindings.voidwarp_tcp_sender_start(
-                            _senderHandle,
-                            ip,
-                            target.Port,
-                            Environment.MachineName
-                        ), _cts.Token);
+                    result = await NativeAsync.StartTcpSenderAsync(
+                        _senderHandle,
+                        ip,
+                        target.Port,
+                        Environment.MachineName,
+                        _cts.Token
+                    );
 
                     if (result == 0)
                     {

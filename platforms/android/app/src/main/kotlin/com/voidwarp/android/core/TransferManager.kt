@@ -92,6 +92,15 @@ class TransferManager(private val context: Context) {
             val checksum = NativeLib.voidwarpTcpSenderGetChecksum(senderHandle)
             val fileSize = NativeLib.voidwarpTcpSenderGetFileSize(senderHandle)
             android.util.Log.d("TransferManager", "File checksum: $checksum, size: $fileSize")
+
+            // Dynamic Chunk Size Optimization
+            val optimalChunkSize = when {
+                fileSize < 10 * 1024 * 1024 -> 64 * 1024      // < 10MB: 64KB (Lower latency)
+                fileSize > 500 * 1024 * 1024 -> 4 * 1024 * 1024 // > 500MB: 4MB (Higher throughput)
+                else -> 1024 * 1024                           // Default: 1MB
+            }
+            NativeLib.voidwarpTcpSenderSetChunkSize(senderHandle, optimalChunkSize)
+            android.util.Log.d("TransferManager", "Set optimized chunk size: $optimalChunkSize bytes")
             
             // Monitor progress
             transferJob = launch {
@@ -112,32 +121,67 @@ class TransferManager(private val context: Context) {
             var usedIp = ""
             
             // Try each IP until success or fatal error
-            for (ip in ips) {
+            val nonLocalIps = filterOutLocalIps(ips)
+            val ipListToUse = if (nonLocalIps.isNotEmpty()) nonLocalIps else ips
+            
+            for (ip in ipListToUse) {
                 if (!isActive || !_isTransferring.value) break
                 
                 val targetIp = ip.trim()
                 _statusMessage.value = "正在连接 $targetIp..."
                 android.util.Log.i("TransferManager", "Attempting transfer to $targetIp:${peer.port}")
                 
-                finalResult = NativeLib.voidwarpTcpSenderStart(
-                    senderHandle,
-                    targetIp,
-                    peer.port,
-                    android.os.Build.MODEL
-                )
+                // Retry loop for the specific IP (handling resume on broken pipe)
+                var retryCount = 0
+                val maxIpRetries = 3
                 
-                if (finalResult == 0) {
-                    usedIp = targetIp
-                    android.util.Log.i("TransferManager", "Transfer success using IP: $targetIp")
-                    break // Success
-                } else if (finalResult == 3) {
+                while (retryCount < maxIpRetries) {
+                    if (!isActive || !_isTransferring.value) break
+                    
+                    if (retryCount > 0) {
+                        _statusMessage.value = "连接中断，正在重试 ($retryCount/$maxIpRetries)..."
+                        delay(1000)
+                    }
+
+                    finalResult = NativeLib.voidwarpTcpSenderStart(
+                        senderHandle,
+                        targetIp,
+                        peer.port,
+                        android.os.Build.MODEL
+                    )
+                    
+                    if (finalResult == 0) {
+                        usedIp = targetIp
+                        android.util.Log.i("TransferManager", "Transfer success using IP: $targetIp")
+                        break // Break retry loop (success)
+                    } else if (finalResult == 6) {
+                         // IO Error (Likely broken pipe / timeout during transfer)
+                         // Since sender supports resume, a simple retry effectively resumes!
+                         retryCount++
+                         android.util.Log.w("TransferManager", "IO Error on $targetIp (Attempt $retryCount). Retrying to resume...")
+                         continue
+                    } else {
+                        // Other errors (Connection failed initially, Rejected, Checksum error) don't benefit from immediate retry on same IP
+                        break 
+                    }
+                }
+
+                if (finalResult == 0) break // Break IP loop (success)
+                
+                if (finalResult == 3) {
                     // Connection failed (timeout/refused), try next IP
-                    android.util.Log.w("TransferManager", "Connection failed to $targetIp (Result 3). Trying next...")
+                    android.util.Log.w("TransferManager", "Connection failed to $targetIp (Result 3). Trying next IP...")
+                    continue
+                } else if (finalResult == 6) {
+                    // If we exhausted retries on IO error, try next IP?
+                    // Actually if IO error happened, it means we DID connect but lost it.
+                    // Trying another IP of the SAME peer might be valid if they switched network?
+                    android.util.Log.e("TransferManager", "IO Error persisted on $targetIp. Trying next IP...")
                     continue
                 } else {
-                    // Fatal error (Rejected=1, Checksum=2, Cancelled=5), stop trying
+                    // Fatal error (Rejected=1, Checksum=2, Cancelled=5), stop trying ANY IP
                     android.util.Log.e("TransferManager", "Fatal error on $targetIp: $finalResult. Aborting.")
-                    usedIp = targetIp // Record which IP gave the fatal error
+                    usedIp = targetIp
                     break
                 }
             }
@@ -164,7 +208,7 @@ class TransferManager(private val context: Context) {
                     onComplete(false, "校验和不匹配 - 文件可能已损坏")
                 }
                 3 -> {
-                    val errorDetail = "连接失败\n已尝试: ${ips.joinToString(", ")}"
+                    val errorDetail = "连接失败\n已尝试: ${ips.joinToString(", ")}\n请确认接收方已开启且在同一网络。"
                     _statusMessage.value = "连接失败"
                     onComplete(false, errorDetail)
                 }
@@ -259,5 +303,24 @@ class TransferManager(private val context: Context) {
                 if (nameIndex >= 0) cursor.getString(nameIndex) else null
             } else null
         }
+    }
+
+    private fun filterOutLocalIps(ips: List<String>): List<String> {
+        val localIps = mutableSetOf<String>()
+        try {
+            val interfaces = java.net.NetworkInterface.getNetworkInterfaces()
+            while (interfaces.hasMoreElements()) {
+                val intf = interfaces.nextElement()
+                val addrs = intf.inetAddresses
+                while (addrs.hasMoreElements()) {
+                    val addr = addrs.nextElement()
+                    if (addr is java.net.Inet4Address) {
+                       localIps.add(addr.hostAddress)
+                    }
+                }
+            }
+        } catch (_: Exception) {}
+        
+        return ips.filter { !localIps.contains(it) }
     }
 }

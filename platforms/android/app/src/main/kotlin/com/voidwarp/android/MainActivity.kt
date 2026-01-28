@@ -477,28 +477,16 @@ fun MainScreen(
                                 if (isDiscovering) {
                                     engine.stopDiscovery()
                                 } else {
-                                    scope.launch(Dispatchers.IO) {
-                                        // CRITICAL: Ensure receiver is started first to get the correct port
-                                        if (receiverState == ReceiverState.IDLE) {
-                                            android.util.Log.d("MainScreen", "Starting receiver before discovery...")
-                                            withContext(Dispatchers.Main) {
-                                                receiveManager.startReceiving()
-                                            }
-                                            // Wait a bit for the receiver to bind the port
-                                            delay(200)
+                                        scope.launch(Dispatchers.IO) {
+                                            // Ensure receiver is ready and get the actual port
+                                            // This prevents the race condition where discovery starts with port 0 or default
+                                            val actualPort = receiveManager.ensureStarted()
+                                            
+                                            android.util.Log.d("MainScreen", "Starting discovery with verified receiver port: $actualPort")
+                                            
+                                            val portToUse = if (actualPort > 0) actualPort else 42424
+                                            engine.startDiscovery(portToUse)
                                         }
-                                        
-                                        // Get the actual receiver port
-                                        val actualPort = receiveManager.port.value
-                                        android.util.Log.d("MainScreen", "Starting discovery with receiver port: $actualPort")
-                                        
-                                        if (actualPort <= 0) {
-                                            android.util.Log.e("MainScreen", "Invalid receiver port, using default 42424")
-                                        }
-                                        
-                                        val portToUse = if (actualPort > 0) actualPort else 42424
-                                        engine.startDiscovery(portToUse)
-                                    }
                                 }
                             },
                             colors = ButtonDefaults.buttonColors(

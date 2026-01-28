@@ -9,7 +9,13 @@ use socket2::{Domain, Protocol, Socket, Type};
 pub const MAGIC: u32 = 0xDEADBEEF;
 const HEADER_LEN: usize = 9;
 const MAX_PAYLOAD_LEN: u32 = 64 * 1024 * 1024;
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+
+// General packet timeout (for Ping/Pong and data packets)
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+
+// Handshake timeout for user interaction (Accept/Reject decisions)
+// This MUST be long enough for the user to manually accept/reject a transfer
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -160,8 +166,11 @@ fn handle_connection(
     peer: SocketAddr,
     connections: Arc<Mutex<Vec<SocketAddr>>>,
 ) {
+    tracing::debug!("Transport connection handler started for {}", peer);
+    
     while let Ok(packet) = read_packet(stream) {
         if packet.header.packet_type == PacketType::Ping {
+            tracing::trace!("Received Ping from {}, sending Pong", peer);
             let pong = Packet {
                 header: PacketHeader {
                     packet_type: PacketType::Pong,
@@ -170,8 +179,16 @@ fn handle_connection(
                 payload: Vec::new(),
             };
             let _ = write_packet(stream, &pong);
+        } else {
+            // Note: This transport layer is for Ping/Pong keep-alive only.
+            // File transfers use a separate TCP connection on the FileReceiverServer port.
+            // Non-Ping packets here are ignored as they're not part of the keep-alive protocol.
+            tracing::trace!("Received non-Ping packet type {:?} from {} on transport port, ignoring", 
+                           packet.header.packet_type, peer);
         }
     }
+    
+    tracing::debug!("Transport connection closed for {}", peer);
     let mut list = connections.lock().unwrap();
     list.retain(|addr| *addr != peer);
 }

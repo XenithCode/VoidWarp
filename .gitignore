@@ -52,3 +52,9 @@ Cargo.lock
 /android_screen*.png
 /android_screenshot.png
 /android_ui.png
+
+# Temporary documentation (logs, reports, summaries)
+docs/*_SUMMARY.md
+docs/*_FIX.md
+docs/*_REPORT*.md
+docs/*_ANALYSIS*.md

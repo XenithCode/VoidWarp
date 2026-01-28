@@ -146,7 +146,7 @@ namespace VoidWarp.Windows.Core
         /// <summary>
         /// Start listening for incoming transfers
         /// </summary>
-        public void StartReceiving()
+        public async Task StartReceivingAsync()
         {
             if (_receiverHandle == IntPtr.Zero)
             {
@@ -155,16 +155,24 @@ namespace VoidWarp.Windows.Core
             }
 
             Debug.WriteLine($"[ReceiveManager] Starting receiver on port {Port}...");
-            
-            NativeBindings.voidwarp_receiver_start(_receiverHandle);
-            
-            // Reset pending transfer state
-            _lastPendingTransfer = null;
-            _pendingTransferHandled = false;
-            
-            StartPolling();
-            
-            Debug.WriteLine("[ReceiveManager] Receiver started, polling active");
+
+            try
+            {
+                await NativeAsync.StartReceiverAsync(_receiverHandle);
+
+                // Reset pending transfer state
+                _lastPendingTransfer = null;
+                _pendingTransferHandled = false;
+
+                StartPolling();
+
+                Debug.WriteLine("[ReceiveManager] Receiver started, polling active");
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[ReceiveManager] Failed to start receiver: {ex.Message}");
+                UpdateState(ReceiverState.Error);
+            }
         }
 
         /// <summary>
@@ -346,7 +354,7 @@ namespace VoidWarp.Windows.Core
                             _lastPendingTransfer = null;
                             _pendingTransferHandled = false;
                             // Restart listening
-                            StartReceiving();
+                            _ = StartReceivingAsync();
                             break; // Exit this polling loop, new one will be started
                         }
                         else if (state == ReceiverState.Idle || state == ReceiverState.Error)

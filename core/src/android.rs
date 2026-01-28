@@ -609,6 +609,18 @@ pub unsafe extern "C" fn Java_com_voidwarp_android_native_NativeLib_voidwarpTcpS
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn Java_com_voidwarp_android_native_NativeLib_voidwarpTcpSenderSetChunkSize(
+    _env: JNIEnv,
+    _class: JClass,
+    sender: jlong,
+    size: jint,
+) {
+    if sender != 0 {
+        ffi::voidwarp_tcp_sender_set_chunk_size(sender as *mut ffi::FfiTcpSender, size as usize);
+    }
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn Java_com_voidwarp_android_native_NativeLib_voidwarpTcpSenderTestLink(
     mut env: JNIEnv,
     _class: JClass,

@@ -18,7 +18,11 @@ pub const DEFAULT_CHUNK_SIZE: usize = 1024 * 1024;
 /// Connection timeout
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Read timeout for ACKs
+/// Handshake timeout (waiting for user accept/reject)
+/// This MUST be long enough for the user to manually accept/reject the transfer
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Read timeout for ACKs during data transfer
 const ACK_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Max retries per chunk
@@ -159,8 +163,17 @@ impl TcpFileSender {
     /// Send file over an established stream
     fn send_over_stream(&self, mut stream: TcpStream, sender_name: &str) -> TransferResult {
         // Send handshake
+        tracing::info!("Sending file offer handshake to receiver...");
         if let Err(e) = self.send_handshake(&mut stream, sender_name) {
+            tracing::error!("Failed to send handshake: {}", e);
             return TransferResult::IoError(format!("Handshake failed: {}", e));
+        }
+        tracing::info!("Handshake sent successfully, waiting for user acceptance...");
+
+        // CRITICAL: Set longer timeout for user acceptance
+        // User needs time to manually accept/reject the transfer
+        if let Err(e) = stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT)) {
+            tracing::warn!("Failed to set handshake timeout: {}", e);
         }
 
         // Wait for accept/reject response
@@ -170,25 +183,47 @@ impl TcpFileSender {
                 if response[0] == 0 {
                     tracing::info!("Transfer rejected by receiver");
                     return TransferResult::Rejected;
+                } else {
+                    tracing::info!("Transfer accepted by receiver!");
                 }
             }
             Err(e) => {
+                tracing::error!("Failed to read accept/reject response: {} (timeout: {:?})", e, HANDSHAKE_TIMEOUT);
+                if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut {
+                    return TransferResult::Timeout;
+                }
                 return TransferResult::IoError(format!("Failed to read response: {}", e));
             }
+        }
+
+        // Reset timeout to ACK_TIMEOUT for data transfer
+        if let Err(e) = stream.set_read_timeout(Some(ACK_TIMEOUT)) {
+            tracing::warn!("Failed to set ACK timeout: {}", e);
         }
 
         tracing::info!("Transfer accepted, starting file transfer...");
 
         // If resuming, read the resume chunk index from receiver
         let start_chunk = if self.resume_from_chunk > 0 {
+            tracing::info!("Resuming from chunk {} (requested by sender)", self.resume_from_chunk);
             self.resume_from_chunk
         } else {
             // Check if receiver wants to resume
             let mut resume_buf = [0u8; 8];
-            if stream.read_exact(&mut resume_buf).is_ok() {
-                u64::from_be_bytes(resume_buf)
-            } else {
-                0
+            match stream.read_exact(&mut resume_buf) {
+                Ok(_) => {
+                    let chunk = u64::from_be_bytes(resume_buf);
+                    if chunk > 0 {
+                        tracing::info!("Receiver requested resume from chunk {}", chunk);
+                    } else {
+                        tracing::info!("Starting fresh transfer from chunk 0");
+                    }
+                    chunk
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to read resume chunk index: {}, starting from 0", e);
+                    0
+                }
             }
         };
 
@@ -242,31 +277,44 @@ impl TcpFileSender {
             // Send chunk with retries
             let mut retries = 0;
             loop {
+                if retries == 0 {
+                    tracing::debug!("Sending chunk {} ({} bytes)", chunk_index, bytes_read);
+                } else {
+                    tracing::warn!("Retrying chunk {} (attempt {}/{})", chunk_index, retries + 1, MAX_RETRIES);
+                }
+
                 if let Err(e) =
                     self.send_chunk(&mut stream, chunk_index, chunk_data, &chunk_checksum)
                 {
-                    tracing::warn!("Failed to send chunk {}: {}", chunk_index, e);
+                    tracing::error!("Failed to send chunk {}: {}", chunk_index, e);
                     retries += 1;
                     if retries >= MAX_RETRIES {
+                        tracing::error!("Max retries exceeded for chunk {}", chunk_index);
                         return TransferResult::IoError(format!("Max retries exceeded: {}", e));
                     }
                     continue;
                 }
 
                 // Wait for ACK
+                tracing::trace!("Waiting for ACK for chunk {}...", chunk_index);
                 match self.wait_for_ack(&mut stream, chunk_index) {
-                    Ok(true) => break, // ACK received
+                    Ok(true) => {
+                        tracing::trace!("Received ACK for chunk {}", chunk_index);
+                        break; // ACK received
+                    }
                     Ok(false) => {
-                        tracing::warn!("Chunk {} checksum failed, retransmitting", chunk_index);
+                        tracing::warn!("Chunk {} checksum verification failed on receiver, retransmitting", chunk_index);
                         retries += 1;
                         if retries >= MAX_RETRIES {
+                            tracing::error!("Max retries exceeded due to checksum mismatch for chunk {}", chunk_index);
                             return TransferResult::ChecksumMismatch;
                         }
                     }
                     Err(e) => {
-                        tracing::warn!("ACK timeout for chunk {}: {}", chunk_index, e);
+                        tracing::error!("Timeout waiting for ACK for chunk {}: {}", chunk_index, e);
                         retries += 1;
                         if retries >= MAX_RETRIES {
+                            tracing::error!("Max retries exceeded due to ACK timeout for chunk {}", chunk_index);
                             return TransferResult::Timeout;
                         }
                     }
@@ -283,50 +331,38 @@ impl TcpFileSender {
         }
 
         // Wait for final verification
+        tracing::info!("All chunks sent, waiting for final verification from receiver...");
         let mut final_result = [0u8; 1];
         match stream.read_exact(&mut final_result) {
             Ok(_) => {
                 if final_result[0] == 1 {
-                    tracing::info!("Transfer completed successfully!");
+                    tracing::info!("✓ Transfer completed successfully! Final checksum verified.");
                     TransferResult::Success
                 } else {
-                    tracing::error!("Final checksum verification failed");
+                    tracing::error!("✗ Final checksum verification failed on receiver");
                     TransferResult::ChecksumMismatch
                 }
             }
-            Err(e) => TransferResult::IoError(format!("Failed to read final result: {}", e)),
+            Err(e) => {
+                tracing::error!("Failed to read final verification result: {}", e);
+                TransferResult::IoError(format!("Failed to read final result: {}", e))
+            }
         }
     }
 
     /// Send handshake packet
     fn send_handshake(&self, stream: &mut TcpStream, sender_name: &str) -> std::io::Result<()> {
-        // Protocol:
-        // [sender_name_len: u8][sender_name][file_name_len: u16 BE][file_name]
-        // [file_size: u64 BE][chunk_size: u32 BE][checksum_len: u8][checksum: 32 bytes hex]
+        use crate::protocol::HandshakeRequest;
 
-        let sender_bytes = sender_name.as_bytes();
-        let file_name = self.file_name();
-        let file_name_bytes = file_name.as_bytes();
-        let checksum_bytes = self.file_checksum.as_bytes();
+        let request = HandshakeRequest::new(
+            sender_name,
+            &self.file_name(),
+            self.file_size,
+            self.chunk_size as u32,
+            &self.file_checksum,
+        );
 
-        // Sender name
-        stream.write_all(&[sender_bytes.len() as u8])?;
-        stream.write_all(sender_bytes)?;
-
-        // File name
-        stream.write_all(&(file_name_bytes.len() as u16).to_be_bytes())?;
-        stream.write_all(file_name_bytes)?;
-
-        // File size
-        stream.write_all(&self.file_size.to_be_bytes())?;
-
-        // Chunk size (NEW)
-        stream.write_all(&(self.chunk_size as u32).to_be_bytes())?;
-
-        // Checksum
-        stream.write_all(&[checksum_bytes.len() as u8])?;
-        stream.write_all(checksum_bytes)?;
-
+        request.write_to(stream)?;
         stream.flush()?;
         Ok(())
     }

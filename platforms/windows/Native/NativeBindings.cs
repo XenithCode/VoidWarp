@@ -1,3 +1,5 @@
+using System.IO;
+using System.Reflection;
 using System.Runtime.InteropServices;
 
 namespace VoidWarp.Windows.Native
@@ -8,6 +10,45 @@ namespace VoidWarp.Windows.Native
     public static partial class NativeBindings
     {
         private const string DllName = "voidwarp_core";
+        private const string DllFileName = "voidwarp_core.dll";
+
+        static NativeBindings()
+        {
+            NativeLibrary.SetDllImportResolver(typeof(NativeBindings).Assembly, ResolveDllImport);
+        }
+
+        private static IntPtr ResolveDllImport(string libraryName, Assembly assembly, DllImportSearchPath? searchPath)
+        {
+            if (!string.Equals(libraryName, DllName, StringComparison.OrdinalIgnoreCase) &&
+                !string.Equals(libraryName, DllFileName, StringComparison.OrdinalIgnoreCase))
+            {
+                return IntPtr.Zero;
+            }
+
+            var baseDir = AppDomain.CurrentDomain.BaseDirectory;
+            if (string.IsNullOrWhiteSpace(baseDir))
+            {
+                return IntPtr.Zero;
+            }
+
+            var candidateDirs = new[]
+            {
+                baseDir,
+                Path.Combine(baseDir, "runtimes", "win-x64", "native"),
+                Path.Combine(baseDir, "native")
+            };
+
+            foreach (var dir in candidateDirs)
+            {
+                var candidatePath = Path.Combine(dir, DllFileName);
+                if (NativeLibrary.TryLoad(candidatePath, out var handle))
+                {
+                    return handle;
+                }
+            }
+
+            return IntPtr.Zero;
+        }
 
         #region Handle Management
 

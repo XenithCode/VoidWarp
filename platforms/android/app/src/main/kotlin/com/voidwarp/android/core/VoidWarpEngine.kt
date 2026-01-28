@@ -140,14 +140,16 @@ class VoidWarpEngine(deviceName: String) : AutoCloseable {
                 return
             }
             val nativePeers = NativeLib.voidwarpGetPeers(handle) ?: emptyArray()
-            _peers.value = nativePeers.map { 
-                DiscoveredPeer(
-                    deviceId = it.deviceId,
-                    deviceName = it.deviceName,
-                    ipAddress = it.ipAddress, // This now contains "ip1,ip2,..."
-                    port = it.port
-                )
-            }
+            _peers.value = nativePeers
+                .filter { it.deviceId != this.deviceId } // Filter out self
+                .map { 
+                    DiscoveredPeer(
+                        deviceId = it.deviceId,
+                        deviceName = it.deviceName,
+                        ipAddress = it.ipAddress, // This now contains "ip1,ip2,..."
+                        port = it.port
+                    )
+                }
         } catch (t: Throwable) {
             android.util.Log.e("VoidWarpEngine", "Failed to refresh peers: ${t.message}", t)
         }
@@ -158,14 +160,20 @@ class VoidWarpEngine(deviceName: String) : AutoCloseable {
             // Try all IPs
             val ips = peer.ipAddress.split(",").filter { it.isNotBlank() }
             for (ip in ips) {
-                android.util.Log.d("VoidWarpEngine", "Testing connection to $ip:${peer.port}")
-                val result = NativeLib.voidwarpTransportPing(ip.trim(), peer.port)
+                val cleanIp = ip.trim()
+                if (cleanIp.isEmpty()) continue
+                
+                android.util.Log.i("VoidWarpEngine", "Testing connection to $cleanIp:${peer.port}...")
+                val result = NativeLib.voidwarpTransportPing(cleanIp, peer.port)
+                
                 if (result) {
-                    android.util.Log.d("VoidWarpEngine", "Connection test passed for $ip")
+                    android.util.Log.i("VoidWarpEngine", "✅ Connection Passed: $cleanIp")
                     return@withContext true
+                } else {
+                    android.util.Log.w("VoidWarpEngine", "❌ Connection Failed: $cleanIp")
                 }
             }
-            android.util.Log.w("VoidWarpEngine", "Connection test failed for all IPs of ${peer.deviceName}")
+            android.util.Log.e("VoidWarpEngine", "All IP connection tests failed for ${peer.deviceName}")
             false
         } catch (t: Throwable) {
             android.util.Log.e("VoidWarpEngine", "Connection test error", t)

@@ -14,7 +14,11 @@ use crate::checksum::{calculate_chunk_checksum, calculate_file_checksum};
 use std::time::Duration;
 
 // Timeouts
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+// Handshake timeout - should be long enough to receive the offer from sender
+// The sender has 60s to send the offer after connecting
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
+
+// Data timeout - for receiving chunks during active transfer
 const DATA_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Incoming transfer request information
@@ -57,17 +61,30 @@ impl FileReceiverServer {
     /// falls back to a random available port if 42424 is in use.
     pub fn new() -> std::io::Result<Self> {
         // Try to bind to the standard port first (for USB/ADB compatibility)
-        let (listener, port) = match TcpListener::bind("0.0.0.0:42424") {
-            Ok(l) => {
-                tracing::info!("FileReceiverServer bound to standard port 42424");
-                (l, 42424)
+        // Try to bind to a range of standard ports (42424-42434)
+        let mut listener_option = None;
+        let mut port = 0;
+
+        for p in 42424..42435 {
+            match TcpListener::bind(format!("0.0.0.0:{}", p)) {
+                Ok(l) => {
+                    tracing::info!("FileReceiverServer bound to port {}", p);
+                    listener_option = Some(l);
+                    port = p;
+                    break;
+                }
+                Err(_) => continue,
             }
-            Err(_) => {
-                // Fall back to any available port
-                let l = TcpListener::bind("0.0.0.0:0")?;
-                let p = l.local_addr()?.port();
-                tracing::info!("Port 42424 in use, bound to fallback port {}", p);
-                (l, p)
+        }
+
+        let listener = match listener_option {
+            Some(l) => l,
+            None => {
+                 // Fallback to random if all fixed ports failed
+                 tracing::warn!("All standard ports (42424-42434) in use, falling back to random");
+                 let l = TcpListener::bind("0.0.0.0:0")?;
+                 port = l.local_addr()?.port();
+                 l
             }
         };
 
@@ -119,14 +136,14 @@ impl FileReceiverServer {
         let pending_stream = self.pending_stream.clone();
 
         thread::spawn(move || {
-            tracing::info!("Receiver thread started");
+            tracing::info!("Receiver thread started, listening for incoming transfers...");
 
             while running.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((mut stream, addr)) => {
-                        tracing::info!("Incoming connection from {}", addr);
+                        tracing::info!("✓ Incoming connection from {}", addr);
 
-                        // Set handshake timeouts
+                        // Set handshake timeouts (long enough to receive the offer)
                         if let Err(e) = stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT)) {
                             tracing::warn!("Failed to set read timeout: {}", e);
                         }
@@ -134,85 +151,47 @@ impl FileReceiverServer {
                             tracing::warn!("Failed to set write timeout: {}", e);
                         }
 
-                        // Read the file transfer handshake
-                        // Protocol: [sender_name_len:u8][sender_name][file_name_len:u16][file_name][file_size:u64]
-                        let mut header = [0u8; 1];
-                        if stream.read_exact(&mut header).is_err() {
-                            tracing::warn!("Failed to read sender name length");
-                            continue;
-                        }
-
-                        let sender_name_len = header[0] as usize;
-                        let mut sender_name_buf = vec![0u8; sender_name_len];
-                        if stream.read_exact(&mut sender_name_buf).is_err() {
-                            tracing::warn!("Failed to read sender name");
-                            continue;
-                        }
-                        let sender_name = String::from_utf8_lossy(&sender_name_buf).to_string();
-
-                        let mut file_name_len_buf = [0u8; 2];
-                        if stream.read_exact(&mut file_name_len_buf).is_err() {
-                            tracing::warn!("Failed to read file name length");
-                            continue;
-                        }
-                        let file_name_len = u16::from_be_bytes(file_name_len_buf) as usize;
-
-                        let mut file_name_buf = vec![0u8; file_name_len];
-                        if stream.read_exact(&mut file_name_buf).is_err() {
-                            tracing::warn!("Failed to read file name");
-                            continue;
-                        }
-                        let file_name = String::from_utf8_lossy(&file_name_buf).to_string();
-
-                        let mut file_size_buf = [0u8; 8];
-                        if stream.read_exact(&mut file_size_buf).is_err() {
-                            tracing::warn!("Failed to read file size");
-                            continue;
-                        }
-                        let file_size = u64::from_be_bytes(file_size_buf);
-
-                        // Read chunk size
-                        let mut chunk_size_buf = [0u8; 4];
-                        if stream.read_exact(&mut chunk_size_buf).is_err() {
-                            tracing::warn!("Failed to read chunk size");
-                            continue;
-                        }
-                        let chunk_size = u32::from_be_bytes(chunk_size_buf);
-
-                        // Read checksum (hex string)
-                        let mut checksum_len_buf = [0u8; 1];
-                        if stream.read_exact(&mut checksum_len_buf).is_err() {
-                            tracing::warn!("Failed to read checksum length");
-                            continue;
-                        }
-                        let checksum_len = checksum_len_buf[0] as usize;
-                        let mut checksum_buf = vec![0u8; checksum_len];
-                        if stream.read_exact(&mut checksum_buf).is_err() {
-                            tracing::warn!("Failed to read checksum");
-                            continue;
-                        }
-                        let file_checksum = String::from_utf8_lossy(&checksum_buf).to_string();
+                        // Read the file transfer handshake using the shared protocol
+                        use crate::protocol::HandshakeRequest;
+                        
+                        tracing::info!("Reading file offer handshake from sender...");
+                        let handshake = match HandshakeRequest::read_from(&mut stream) {
+                            Ok(h) => {
+                                tracing::info!("Handshake received successfully");
+                                h
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to read handshake: {}", e);
+                                // Try to send error byte if possible
+                                let _ = stream.write_all(&[5u8]); // 5 = Reject/Error
+                                let _ = stream.flush();
+                                continue;
+                            }
+                        };
 
                         tracing::info!(
-                            "Incoming transfer: '{}' ({} bytes) from '{}'",
-                            file_name,
-                            file_size,
-                            sender_name
+                            "📥 Incoming transfer offer:\n  File: '{}'\n  Size: {} bytes\n  From: '{}'\n  Address: {}",
+                            handshake.file_name,
+                            handshake.file_size,
+                            handshake.sender_name,
+                            addr
                         );
 
                         // Store pending transfer info
                         let transfer = IncomingTransfer {
-                            sender_name,
+                            sender_name: handshake.sender_name,
                             sender_addr: addr,
-                            file_name,
-                            file_size,
-                            chunk_size,
-                            file_checksum,
+                            file_name: handshake.file_name,
+                            file_size: handshake.file_size,
+                            chunk_size: handshake.chunk_size,
+                            file_checksum: handshake.file_checksum,
                         };
 
                         *pending_transfer.lock().unwrap() = Some(transfer);
                         *pending_stream.lock().unwrap() = Some(stream);
                         *state.lock().unwrap() = ReceiverState::AwaitingAccept;
+
+                        tracing::info!("⏳ Awaiting user acceptance/rejection...");
 
                         // Wait for accept/reject (handled by accept_transfer/reject_transfer)
                         break;
@@ -247,6 +226,7 @@ impl FileReceiverServer {
 
         match (transfer, stream) {
             (Some(info), Some(mut conn)) => {
+                tracing::info!("✓ User accepted transfer, saving to: {:?}", save_path);
                 *self.state.lock().unwrap() = ReceiverState::Receiving;
                 self.total_bytes.store(info.file_size, Ordering::SeqCst);
                 self.bytes_received.store(0, Ordering::SeqCst);
@@ -260,9 +240,10 @@ impl FileReceiverServer {
                 }
 
                 // Send accept response
+                tracing::info!("Sending acceptance confirmation to sender...");
                 if let Err(e) = conn.write_all(&[1u8]) {
                     // 1 = accepted
-                    tracing::error!("Failed to send accept: {}", e);
+                    tracing::error!("Failed to send accept response: {}", e);
                     return Err(e);
                 }
 
@@ -301,14 +282,19 @@ impl FileReceiverServer {
                 }
 
                 // Send resume index
+                tracing::info!("Sending resume index {} to sender", start_chunk_index);
                 if let Err(e) = conn.write_all(&start_chunk_index.to_be_bytes()) {
-                    tracing::warn!("Failed to send resume index: {}", e);
+                    tracing::error!("Failed to send resume index: {}", e);
+                    return Err(e);
                 }
                 // CRITICAL: flush to ensure sender receives accept + resume index immediately
                 if let Err(e) = conn.flush() {
-                    tracing::warn!("Failed to flush accept response: {}", e);
+                    tracing::error!("Failed to flush accept response: {}", e);
+                    return Err(e);
                 }
 
+                tracing::info!("Starting to receive file chunks...");
+                let mut last_log_chunk = 0u64;
                 loop {
                     // Check if transfer is complete
                     if received >= info.file_size {
@@ -327,6 +313,12 @@ impl FileReceiverServer {
                     let chunk_len =
                         u32::from_be_bytes(header_buf[8..12].try_into().unwrap()) as usize;
 
+                    // Log progress periodically (every 100 chunks)
+                    if chunk_index - last_log_chunk >= 100 || chunk_index == 0 {
+                        tracing::debug!("Receiving chunk {} ({} bytes)", chunk_index, chunk_len);
+                        last_log_chunk = chunk_index;
+                    }
+
                     // Read chunk data
                     let mut data = vec![0u8; chunk_len];
                     conn.read_exact(&mut data)?;
@@ -343,7 +335,7 @@ impl FileReceiverServer {
                         .collect();
 
                     if calculated_bytes != chunk_checksum_buf {
-                        tracing::warn!("Checksum mismatch for chunk {}", chunk_index);
+                        tracing::warn!("✗ Checksum mismatch for chunk {}, requesting retransmit", chunk_index);
                         // Send ACK with error (1)
                         conn.write_all(&chunk_index.to_be_bytes())?;
                         conn.write_all(&[1u8])?;
@@ -357,26 +349,34 @@ impl FileReceiverServer {
                     self.bytes_received.store(received, Ordering::SeqCst);
 
                     // Send ACK success (0)
+                    tracing::trace!("✓ Chunk {} verified, sending ACK", chunk_index);
                     conn.write_all(&chunk_index.to_be_bytes())?;
                     conn.write_all(&[0u8])?;
                     conn.flush()?; // Flush ACK immediately to prevent sender timeout
                 }
 
                 // Final verification
+                tracing::info!("All chunks received, flushing to disk and verifying...");
                 file.flush()?;
 
+                tracing::info!("Calculating final file checksum...");
                 let final_checksum = calculate_file_checksum(save_path)?;
                 let success = final_checksum == info.file_checksum;
 
                 if success {
-                    tracing::info!("Transfer completed and verified!");
+                    tracing::info!("✓ Transfer completed successfully! Final checksum verified.");
+                    tracing::info!("  Expected: {}", info.file_checksum);
+                    tracing::info!("  Received: {}", final_checksum);
                     conn.write_all(&[1u8])?; // Final success
                     let _ = conn.flush(); // Ensure sender receives final result
                     *self.state.lock().unwrap() = ReceiverState::Completed;
                 } else {
-                    tracing::error!("Final checksum verification failed");
+                    tracing::error!("✗ Final checksum verification failed!");
+                    tracing::error!("  Expected: {}", info.file_checksum);
+                    tracing::error!("  Received: {}", final_checksum);
                     conn.write_all(&[0u8])?; // Final failure
                     let _ = conn.flush();
+                    *self.state.lock().unwrap() = ReceiverState::Error;
                 }
 
                 // Important: Reset running flag so we can restart the listener loop
@@ -398,11 +398,16 @@ impl FileReceiverServer {
 
     /// Reject the pending transfer
     pub fn reject_transfer(&self) -> std::io::Result<()> {
-        let _transfer = self.pending_transfer.lock().unwrap().take();
+        let transfer = self.pending_transfer.lock().unwrap().take();
         let stream = self.pending_stream.lock().unwrap().take();
+
+        if let Some(info) = transfer {
+            tracing::info!("✗ User rejected transfer: '{}' from '{}'", info.file_name, info.sender_name);
+        }
 
         if let Some(mut conn) = stream {
             // Send reject response
+            tracing::info!("Sending rejection notification to sender...");
             let _ = conn.write_all(&[0u8]); // 0 = rejected
             let _ = conn.flush(); // Ensure sender receives rejection immediately
         }
@@ -413,6 +418,7 @@ impl FileReceiverServer {
         self.running.store(false, Ordering::SeqCst);
 
         // Restart listening
+        tracing::info!("Restarting receiver to listen for next transfer...");
         self.start();
 
         Ok(())

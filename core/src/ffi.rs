@@ -757,6 +757,19 @@ pub extern "C" fn voidwarp_tcp_sender_create(path: *const c_char) -> *mut FfiTcp
     }
 }
 
+/// Set chunk size for the sender (in bytes)
+#[no_mangle]
+pub extern "C" fn voidwarp_tcp_sender_set_chunk_size(
+    sender: *mut FfiTcpSender,
+    size: usize,
+) {
+    if !sender.is_null() && size > 0 {
+        unsafe {
+            (*sender).sender.set_chunk_size(size);
+        }
+    }
+}
+
 /// Start TCP transfer to the target address
 /// Returns: 0=Success, 1=Rejected, 2=ChecksumMismatch, 3=ConnectionFailed, 4=Timeout, 5=Cancelled, 6=IoError
 #[no_mangle]
@@ -887,21 +900,28 @@ pub extern "C" fn voidwarp_transport_start_server(port: u16) -> bool {
 }
 
 #[no_mangle]
-pub extern "C" fn voidwarp_transport_ping(ip_address: *const c_char, port: u16) -> bool {
+pub extern "C" fn voidwarp_transport_ping(
+    ip_address: *const c_char,
+    port: u16,
+) -> bool {
     if ip_address.is_null() {
         return false;
     }
+
     let ip_str = unsafe { CStr::from_ptr(ip_address) }.to_string_lossy();
-    let ip: IpAddr = match ip_str.parse() {
+    let ip: std::net::IpAddr = match ip_str.parse() {
         Ok(ip) => ip,
         Err(_) => return false,
     };
-    let addr = SocketAddr::new(ip, port);
-    let mut client = match TransportClient::connect(addr, Duration::from_secs(3)) {
-        Ok(client) => client,
-        Err(_) => return false,
-    };
-    matches!(client.ping(), Ok(true))
+
+    let addr = std::net::SocketAddr::new(ip, port);
+    
+    // Just try to connect - if we can connect, the port is open and reachable.
+    // We don't need a full protocol handshake for a basic liveness check.
+    match std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(2)) {
+        Ok(_) => true,
+        Err(_) => false,
+    }
 }
 
 #[cfg(test)]

@@ -5,7 +5,6 @@ using System.Runtime.CompilerServices;
 using System.Windows;
 using System.Windows.Input;
 using System.Windows.Media;
-using System.Windows.Threading;
 using Microsoft.Win32;
 using VoidWarp.Windows;
 using VoidWarp.Windows.Core;
@@ -14,7 +13,6 @@ namespace VoidWarp.Windows.ViewModels
 {
     public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
     {
-        private readonly Dispatcher _dispatcher;
         private readonly VoidWarpEngine _engine;
         private readonly TransferManager _transferManager;
         private readonly ReceiveManager _receiveManager;
@@ -51,8 +49,6 @@ namespace VoidWarp.Windows.ViewModels
 
         public MainViewModel()
         {
-            _dispatcher = Application.Current.Dispatcher;
-
             _engine = new VoidWarpEngine(Environment.MachineName);
             _transferManager = new TransferManager();
             _receiveManager = new ReceiveManager();
@@ -129,7 +125,7 @@ namespace VoidWarp.Windows.ViewModels
                 {
                     if (value)
                     {
-                        _receiveManager.StartReceiving();
+                        _ = _receiveManager.StartReceivingAsync();
                         ReceiveStatusText = "等待接收文件...";
                         ReceivePortText = $"监听端口: {_receiveManager.Port}";
                         TransferStatusText = "接收模式已开启";
@@ -262,7 +258,7 @@ namespace VoidWarp.Windows.ViewModels
 
         private void InitializeReceiving()
         {
-            _receiveManager.StartReceiving();
+            _ = _receiveManager.StartReceivingAsync();
             _isReceiveModeEnabled = true;
             OnPropertyChanged(nameof(IsReceiveModeEnabled));
             ReceivePortText = $"监听端口: {_receiveManager.Port}";
@@ -411,7 +407,7 @@ namespace VoidWarp.Windows.ViewModels
 
         private void OnPeersChanged(object? sender, PeersChangedEventArgs e)
         {
-            _dispatcher.BeginInvoke(() =>
+            Application.Current.Dispatcher.Invoke(() =>
             {
                 Debug.WriteLine($"[MainViewModel] Peers changed, count: {e.Count}");
                 Peers.Clear();
@@ -433,7 +429,7 @@ namespace VoidWarp.Windows.ViewModels
 
         private void OnDiscoveryStateChanged(object? sender, DiscoveryStateChangedEventArgs e)
         {
-            _dispatcher.BeginInvoke(() =>
+            Application.Current.Dispatcher.Invoke(() =>
             {
                 Debug.WriteLine($"[MainViewModel] Discovery state changed: {e.State}");
                 DiscoveryDetailText = e.Message ?? string.Empty;
@@ -468,7 +464,7 @@ namespace VoidWarp.Windows.ViewModels
 
         private void OnDiscoveryDiagnosticsChanged(object? sender, DiscoveryDiagnosticsChangedEventArgs e)
         {
-            _dispatcher.BeginInvoke(() =>
+            Application.Current.Dispatcher.Invoke(() =>
             {
                 LocalNetworkText = $"本机网络: {e.InterfaceName} / {e.LocalIpAddress}";
                 UpdateNetworkDiagnostics();
@@ -477,7 +473,7 @@ namespace VoidWarp.Windows.ViewModels
 
         private void OnReceiverStateChanged(object? sender, ReceiverStateChangedEventArgs e)
         {
-            _dispatcher.BeginInvoke(() =>
+            Application.Current.Dispatcher.Invoke(() =>
             {
                 switch (e.NewState)
                 {
@@ -502,7 +498,7 @@ namespace VoidWarp.Windows.ViewModels
 
         private void OnTransferProgressChanged(TransferProgressInfo progress)
         {
-            _dispatcher.Invoke(() =>
+            Application.Current.Dispatcher.Invoke(() =>
             {
                 TransferProgress = progress.Percentage;
                 TransferStatusText = $"{progress.FormattedProgress} ({progress.FormattedSpeed})";
@@ -511,7 +507,7 @@ namespace VoidWarp.Windows.ViewModels
 
         private void OnTransferCompleted(bool success, string? error)
         {
-            _dispatcher.Invoke(() =>
+            Application.Current.Dispatcher.Invoke(() =>
             {
                 if (success)
                 {
@@ -529,7 +525,7 @@ namespace VoidWarp.Windows.ViewModels
 
         private void OnIncomingTransfer(PendingTransferInfo transfer)
         {
-            _dispatcher.Invoke(() =>
+            Application.Current.Dispatcher.Invoke(() =>
             {
                 _pendingTransfer = transfer;
                 IncomingTransferVisible = true;
@@ -555,7 +551,7 @@ namespace VoidWarp.Windows.ViewModels
 
         private void OnReceiveProgressChanged(float progress)
         {
-            _dispatcher.Invoke(() =>
+            Application.Current.Dispatcher.Invoke(() =>
             {
                 TransferProgress = progress;
                 TransferStatusText = $"正在接收... {progress:F1}%";
@@ -564,7 +560,7 @@ namespace VoidWarp.Windows.ViewModels
 
         private void OnReceiveCompleted(bool success, string? error)
         {
-            _dispatcher.Invoke(() =>
+            Application.Current.Dispatcher.Invoke(() =>
             {
                 IncomingTransferVisible = false;
                 DropZoneVisible = true;

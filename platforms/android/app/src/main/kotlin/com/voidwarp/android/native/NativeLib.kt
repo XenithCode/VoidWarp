@@ -80,6 +80,7 @@ object NativeLib {
     // ========================================================================
     
     external fun voidwarpTcpSenderCreate(filePath: String): Long
+    external fun voidwarpTcpSenderSetChunkSize(sender: Long, size: Int)
     external fun voidwarpTcpSenderStart(sender: Long, ipAddress: String, port: Int, senderName: String): Int
     external fun voidwarpTcpSenderGetChecksum(sender: Long): String?
     external fun voidwarpTcpSenderGetFileSize(sender: Long): Long
