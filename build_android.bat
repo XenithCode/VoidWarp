@@ -27,7 +27,8 @@ if %ERRORLEVEL% NEQ 0 (
 cd ..
 
 echo Copying .so to jniLibs...
-copy "core\target\aarch64-linux-android\release\libvoidwarp_core.so" "platforms\android\app\src\main\jniLibs\arm64-v8a\" >nul
+REM Workspace target is at repo root (not core\target) when building from core\
+copy "target\aarch64-linux-android\release\libvoidwarp_core.so" "platforms\android\app\src\main\jniLibs\arm64-v8a\" >nul
 
 :: Build ARMv7 (Old Devices) - Optional, uncomment if needed
 :: echo.
